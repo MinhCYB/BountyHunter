@@ -19,7 +19,7 @@ Copy và chạy các lệnh sau trong Terminal/Command Prompt:
 ## Cấu trúc 
 
 ```text
-datathon_2026_teamX/
+BountyHunter/
 │
 ├── data/                   
 │   ├── raw/              Dữ liệu thô  
