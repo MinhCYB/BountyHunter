@@ -4,6 +4,10 @@ env/
 Lib/
 Scripts/
 
+__pycache__/
+*.py[cod]
+*$py.class
+
 data/raw/*
 data/processed/*
 data/features/*
