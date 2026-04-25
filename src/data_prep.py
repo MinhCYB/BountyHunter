@@ -38,40 +38,6 @@ Dependency quan trọng:
   config.PROCESSED/mart_product_performance.parquet — Data Mart: Hiệu suất sản phẩm
   config.PROCESSED/mart_promo_campaign.parquet      — Data Mart: Hiệu quả khuyến mãi
 
-Changelog (tích lũy từ v1 → v3):
-  --- v2 (review nội bộ) ---
-  [FIX]  run_prep()                       — default force_rebuild=True → False.
-  [FIX]  _process_operation_cluster()     — đổi tên total_stockout_days →
-                                            monthly_stockout_days + thêm stockout_rate_per_day.
-  [FIX]  build_master_table()             — thêm fillna cho avg_daily_rating.
-  [ADD]  _process_operation_cluster()     — avg_conversion_rate, avg_stock_on_hand.
-  [ADD]  _engineer_promotional_features() — tách promo_discount_p1 / p2.
-  [ADD]  _build_promo_campaign_mart()     — ROI tính trên p1_discount riêng.
-
-  --- v3 (sau data profiling & Gemini review) ---
-  [FIX-CRITICAL] build_master_table()             — Data Leakage: thay fillna(global_median)
-                                                    bằng ffill().fillna(0) cho avg_daily_rating.
-                                                    Global median bao gồm future data → rò rỉ
-                                                    thông tin tương lai vào tập train.
-  [FIX-CRITICAL] _engineer_promotional_features() — Float Precision Noise: thêm tolerance
-                                                    threshold 1.0 VND trước clip() để loại
-                                                    leakage ảo do sai số IEEE 754.
-  [FIX-CRITICAL] _cast_data_types()               — Silent Merge Failure: quét cột *_id kiểu
-                                                    object, ép cứng về str và cắt đuôi '.0'
-                                                    do pandas tự ép NaN-mixed → float64.
-  [FIX-CRITICAL] _process_operation_cluster()     — Missing Back-fill: thêm bfill() sau ffill()
-                                                    để phủ kín giai đoạn 2012 (trước snapshot
-                                                    inventory đầu tiên) tránh NaN khi train.
-  [FIX]  _build_promo_campaign_mart()             — ROI Exploding: thay clip(lower=0.01) bằng
-                                                    np.where(cost <= 0, 0, rev/cost).
-  [ADD]  _cast_data_types()                       — Drop cột CONSTANT reorder_flag (toàn bộ=0
-                                                    xác nhận từ profiling: Unique=1, Range:0→0).
-  [ADD]  _process_operation_cluster()             — page_views, avg_session_duration_sec từ
-                                                    web_traffic (có trong raw, chưa được dùng).
-  [ADD]  _process_operation_cluster()             — days_of_supply với clip(upper=365) xử lý
-                                                    outlier cực lớn (profiling: max=68,100).
-  [ADD]  _process_operation_cluster()             — Pivot traffic_source → pct_* columns
-                                                    (tỷ trọng kênh traffic theo ngày).
   [NOTE] web_traffic bắt đầu 2013-01-01, sales từ 2012-07-04 → gap ~6 tháng đầu
          traffic = NaN, được điền 0 qua zero_fill_cols (không có session = 0).
   [NOTE] promo_id_2 null ~100% nhưng profiling cho thấy có 2 unique values
@@ -86,14 +52,10 @@ from src.config import config
 
 logger = config.get_logger(__name__)
 
-# Ngưỡng sai số dấu phẩy động (VND) — leakage nhỏ hơn ngưỡng này là float noise
-_LEAKAGE_TOLERANCE_VND = 1.0
-
-# Cột ID kiểu string cần chuẩn hóa để tránh Silent Merge Failure
-_STRING_ID_COLS = {"promo_id", "promo_id_2", "return_id", "review_id"}
-
-# Cột CONSTANT xác nhận từ profiling report — drop để giảm noise cho feature matrix
-_CONSTANT_COLS = {"reorder_flag"}
+# Các hằng số schema và ngưỡng sai số được quản lý tập trung tại src/config.py:
+#   config.MATH_TOLERANCE_MIN  — ngưỡng float noise VND  (≡ config.MATH_TOLERANCE_MIN cũ)
+#   config.STRING_ID_COLS      — cột ID string cần chuẩn hóa
+#   config.CONSTANT_COLS       — cột hằng số cần drop
 
 
 # ==========================================
@@ -115,7 +77,7 @@ def _cast_data_types(name: str, df: pd.DataFrame) -> pd.DataFrame:
        (VD: promo_id "PROMO-0014" mixed với NaN → đọc thành "PROMO-0014" OK,
        nhưng nếu cột là số như order_id thì "123" → 123.0 dưới dạng str là "123.0").
        Khi merge, key "123" ≠ "123.0" → join miss → rớt sạch dữ liệu.
-       Fix: Quét tất cả cột thuộc _STRING_ID_COLS, ép về str, cắt đuôi '.0'
+       Fix: Quét tất cả cột thuộc config.STRING_ID_COLS, ép về str, cắt đuôi '.0'
        bằng regex, đặt lại NaN cho các giá trị "nan" và "".
 
     3. Chuẩn hóa cột text đặc biệt:
@@ -139,7 +101,7 @@ def _cast_data_types(name: str, df: pd.DataFrame) -> pd.DataFrame:
                 df[col] = pd.to_datetime(df[col], errors="coerce")
 
     # Bước 2: Chuẩn hóa ID string — tránh Silent Merge Failure
-    for col in _STRING_ID_COLS:
+    for col in config.STRING_ID_COLS:
         if col in df.columns:
             df[col] = (
                 df[col].astype(str)
@@ -154,7 +116,7 @@ def _cast_data_types(name: str, df: pd.DataFrame) -> pd.DataFrame:
         df["applicable_category"] = df["applicable_category"].fillna("All").astype(str)
 
     # Bước 4: Drop cột CONSTANT
-    cols_to_drop = [c for c in _CONSTANT_COLS if c in df.columns]
+    cols_to_drop = [c for c in config.CONSTANT_COLS if c in df.columns]
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
         logger.info(f"   [{name}] Drop cột CONSTANT: {cols_to_drop}")
@@ -231,7 +193,7 @@ def _engineer_promotional_features(order_items: pd.DataFrame, promotions: pd.Dat
     Bước 5 & 6 — Float Precision Tolerance + Clip [FIX v3]:
         Phép trừ float sinh sai số IEEE 754 (~0.0001 VND). Nếu không lọc,
         hàng nghìn dòng bị gán leakage ảo, làm nhiễu Data Mart và ML features.
-        Fix: raw_leakage < _LEAKAGE_TOLERANCE_VND (1.0 VND) → coi là 0.
+        Fix: raw_leakage < config.MATH_TOLERANCE_MIN (1.0 VND) → coi là 0.
         Sau đó clip(lower=0) để chỉ giữ trường hợp công ty bị thiệt.
 
     Args:
@@ -299,7 +261,7 @@ def _engineer_promotional_features(order_items: pd.DataFrame, promotions: pd.Dat
     # Bước 5 & 6: Float tolerance filter + clip
     raw_leakage = df_m["discount_amount"].fillna(0) - df_m["expected_discount"]
     df_m["revenue_leakage"] = np.where(
-        raw_leakage.abs() < _LEAKAGE_TOLERANCE_VND,
+        raw_leakage.abs() < config.MATH_TOLERANCE_MIN,
         0.0,
         raw_leakage
     )
@@ -395,7 +357,7 @@ def _process_customer_cluster() -> pd.DataFrame:
     reviews["Date"] = reviews["review_date"].dt.normalize()
     daily_rev = reviews.groupby("Date").agg(
         avg_daily_rating   =("rating",    "mean"),
-        daily_review_count =("review_id", "count")
+        daily_review_count =("review_id", "nunique")  # [FIX v4] nunique để nhất quán với daily_returns/daily_orders
     ).reset_index()
 
     return pd.merge(daily_ret, daily_rev, on="Date", how="outer")
@@ -408,7 +370,7 @@ def _process_operation_cluster(date_spine: pd.DataFrame) -> pd.DataFrame:
     Web Traffic (granularity: ngày):
         Khai thác đầy đủ các cột có trong raw mà phiên bản trước bỏ sót:
           - total_sessions, total_visitors, total_page_views
-          - avg_bounce_rate, avg_conversion_rate, avg_session_duration_sec
+          - avg_bounce_rate, avg_session_duration_sec
           - pct_organic, pct_paid, pct_social, pct_email, pct_direct, pct_referral:
             Pivot traffic_source → tỷ trọng kênh theo ngày. Cho phép phân tích
             channel mix không cần one-hot encoding riêng ở bước feature engineering.
@@ -455,7 +417,6 @@ def _process_operation_cluster(date_spine: pd.DataFrame) -> pd.DataFrame:
             total_visitors           =("unique_visitors",          "sum"),
             total_page_views         =("page_views",               "sum"),
             avg_bounce_rate          =("bounce_rate",              "mean"),
-            avg_conversion_rate      =("conversion_rate",          "mean"),
             avg_session_duration_sec =("avg_session_duration_sec", "mean"),
             **src_agg
         )
@@ -722,8 +683,12 @@ def _build_product_performance_mart():
         product_mart["units_returned"] / product_mart["units_sold"].clip(lower=1)
     )
     product_mart["total_cogs_amount"] = product_mart["units_sold"] * product_mart["cogs"]
+    # [FIX v4] Gross Margin = (Gross Revenue - COGS) / Gross Revenue
+    # Phiên bản cũ dùng net_revenue (đã trừ discount + refund) → tính ra Net Margin,
+    # không phải Gross Margin. Khi refund lớn, net_revenue âm → gross_margin_rate âm
+    # dù sản phẩm vẫn có lãi gộp thực → sai lệch nghiêm trọng trong phân tích BI.
     product_mart["gross_margin_rate"] = (
-        (product_mart["net_revenue"] - product_mart["total_cogs_amount"])
+        (product_mart["total_gross_revenue"] - product_mart["total_cogs_amount"])
         / product_mart["total_gross_revenue"].clip(lower=0.01)
     )
 

@@ -743,7 +743,7 @@ def run_audit():
 
     df = pd.DataFrame(audit_report)
     if len(df) > 0:
-        output_path = config.PROCESSED / "qa_report.csv"
+        output_path = config.REPORTS / "qa_report.csv"
         df.to_csv(output_path, index=False, encoding="utf-8-sig")
         logger.info(f"[SUMMARY] Structural: {s} | Business: {b} | Referential: {r} | Reconciliation: {rc} lỗi")
         logger.info(f"Phát hiện {len(df)} lỗi. Lưu tại {output_path}")
