@@ -16,7 +16,6 @@ logger = config.get_logger(__name__)
 def run_prof():
     logger.info("Bắt đầu quét danh sách SOURCE_TABLES để lập báo cáo chất lượng dữ liệu...")
     
-    # Định dạng file đầu ra chuyên nghiệp
     output_file = config.REPORTS / "data_profiling_report.md"
     
     with open(output_file, "w", encoding="utf-8") as f:
@@ -47,7 +46,7 @@ def run_prof():
             f.write(f"- Tổng số dòng: {total_rows:,}\n")
             f.write(f"- Tổng số cột: {len(df.columns)}\n\n")
             
-            # Bảng Metadata (Đã loại bỏ cột PK)
+            # Bảng Metadata 
             f.write("| Tên Cột | Kiểu Dữ Liệu | Null (%) | Unique | Phân bố / Giá trị (Distribution) | Ghi chú (Flags) |\n")
             f.write("| :--- | :--- | :--- | :--- | :--- | :--- |\n")
             
@@ -56,7 +55,6 @@ def run_prof():
                 null_pct = (df[col].isna().sum() / total_rows) * 100 if total_rows > 0 else 0
                 n_unique = df[col].nunique(dropna=True)
                 
-                # CHỈ GIỮ LẠI CÁC CẢNH BÁO VỀ CHẤT LƯỢNG DỮ LIỆU
                 flags = []
                 if n_unique == 1:
                     flags.append("CONSTANT")

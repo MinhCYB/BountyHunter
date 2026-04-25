@@ -92,6 +92,16 @@ class Config:
     MATH_TOLERANCE_PCT = 0.001  # Sai số tương đối (0.1%)
     MATH_TOLERANCE_MIN = 1.0    # Chặn dưới sai số tối thiểu (1.0 VND)
 
+    # ==========================================
+    # SCHEMA METADATA (DATA QUALITY)
+    # ==========================================
+    # Cột ID kiểu string cần chuẩn hóa — tránh Silent Merge Failure khi pandas
+    # tự ép NaN-mixed column sang float64 (vd: "123" → "123.0" → join miss).
+    STRING_ID_COLS = {"promo_id", "promo_id_2", "return_id", "review_id"}
+ 
+    # Cột hằng số xác nhận từ profiling report (Unique=1) — drop để giảm noise
+    CONSTANT_COLS = {"reorder_flag"}
+
     def __init__(self): 
         self.LOGS.mkdir(parents=True, exist_ok=True) 
         with open(self.LOG_FILE_PATH, "w", encoding="utf-8"):
