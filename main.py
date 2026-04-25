@@ -1,6 +1,6 @@
 import argparse
 from src.config import config
-from src import data_audit, data_prep, feature_eng, train, inference 
+from src import data_audit, data_profiler, data_prep, feature_eng, train, inference 
 
 logger = config.get_logger(__name__)
 
@@ -8,6 +8,7 @@ def main():
     parser = argparse.ArgumentParser(description="Pipeline dự báo doanh thu - Datathon 2026 - BountyHunter")
     
     parser.add_argument("--audit", action="store_true", help="Quét lỗi và xuất báo cáo QA") 
+    parser.add_argument("--prof", action="store_true", help="Hồ sơ hoá dữ liệu") 
     parser.add_argument("--prep", action="store_true", help="Làm sạch dữ liệu")
     parser.add_argument("--feat", action="store_true", help="Tạo đặc trưng")
     parser.add_argument("--train", action="store_true", help="Huấn luyện mô hình")
@@ -22,6 +23,9 @@ def main():
 
     if args.audit:
         data_audit.run_audit()
+
+    if args.prof:
+        data_profiler.run_prof()
 
     if args.all or args.prep:
         data_prep.run_prep() 

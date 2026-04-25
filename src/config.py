@@ -5,20 +5,31 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1] 
 
 class Config: 
-    # Data paths
+    # ==========================================
+    # FILE, FOLDER PATH
+    # ==========================================
     RAW = PROJECT_ROOT / "data/raw"
     PROCESSED = PROJECT_ROOT / "data/processed"
     FEATURES = PROJECT_ROOT / "data/features" 
     SUBMISSIONS = PROJECT_ROOT / "submissions"
+    REPORTS = PROJECT_ROOT / "reports"
     LOGS = PROJECT_ROOT / "logs"
     LOG_FILE_PATH = LOGS / "BountyHunter.log"
 
 
-    # Model config
+    # ==========================================
+    # MODEL CONFIG
+    # ==========================================
     RANDOM_STATE = 42 
     PARAMS = {
         # Thêm sau    
     }
+
+    # ==========================================
+    # DATE SPINE CONFIGURATION (TRỤC THỜI GIAN)
+    # ==========================================
+    DATE_SPINE_START = '2012-07-04'
+    DATE_SPINE_END = '2024-07-01'
 
     # Prep & audit
     SOURCE_TABLES = [
