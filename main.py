@@ -1,6 +1,6 @@
 import argparse
 from src.config import config
-from src import data_audit, data_profiler, data_prep, feature_eng, train, inference 
+from src import data_audit, data_profiler, data_prep, feature_eng, train, model_selection, inference 
 
 logger = config.get_logger(__name__)
 
@@ -13,14 +13,18 @@ def main():
     parser.add_argument("--feat", action="store_true", help="Tạo đặc trưng")
     parser.add_argument("--train", action="store_true", help="Huấn luyện mô hình")
     parser.add_argument("--infer", action="store_true", help="Dự đoán và xuất submissions")
-    parser.add_argument("--all", action="store_true", help="Chạy toàn bộ pipeline (Trừ Audit)")
+    parser.add_argument("--all", action="store_true", help="Chạy toàn bộ pipeline prep -> feat -> train -> infer")
     
+    model_selection.add_arguments(parser)
+
     args = parser.parse_args()
 
     if not any(vars(args).values()):
         parser.print_help()
         return
-
+    
+    model_selection.dispatch(args)
+    
     if args.audit:
         data_audit.run_audit()
 
@@ -31,7 +35,7 @@ def main():
         data_prep.run_prep() 
 
     if args.all or args.feat:
-        feature_eng.run_features()
+        feature_eng.run_feature_engineering()
 
     if args.all or args.train:
         train.run_train()
