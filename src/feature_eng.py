@@ -341,6 +341,9 @@ def build_calendar_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     df["is_quarter_start"] = dt.is_quarter_start.astype("int8")
     df["is_quarter_end"]   = dt.is_quarter_end.astype("int8")
 
+    # FIX-1: linear trend proxy for tree-based models
+    df["trend_index"] = (df["date"] - df["date"].min()).dt.days.astype(int)
+
     cols_added = df.shape[1] - cols_before
     logger.info("[Nhóm A] build_calendar_features: +%d cột", cols_added)
     return df
@@ -805,12 +808,12 @@ def split_and_save(
     test_df.to_parquet(test_path, index=False)
 
     try: 
-        fackk = train_df.columns
+        mimi = train_df.columns
         
-        gluglu = pd.DataFrame(fackk) 
+        gluglu = pd.DataFrame(mimi) 
         gluglu.to_csv(processed_dir / "gluglu.csv") 
     except Exception as e: 
-        print(f"{type(fackk)} đìt còn mè")
+        print(f"{type(mimi)} ")
     logger.info(
         "Đã ghi train_features: %d dòng × %d cột → %s",
         len(train_df), train_df.shape[1], train_path,

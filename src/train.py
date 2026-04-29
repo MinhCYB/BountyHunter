@@ -206,14 +206,20 @@ def expanding_window_cv(
     all_dates = df[date_col].sort_values().unique()
     total_days = len(all_dates)
 
-    val_size = (total_days - min_train_days) // n_splits
+    # FIX-2: fix val_size to match real forecast horizon (~1.5 years)
+    VAL_SIZE = 500  # approx 500 days ≈ 1.5 years; tune if needed
+    MIN_TRAIN_SIZE = VAL_SIZE * 2
 
     for fold in range(n_splits):
-        train_end_idx = min_train_days + fold * val_size
-        val_end_idx = train_end_idx + val_size
-
+        val_end_idx = total_days - fold * VAL_SIZE
+        val_start_idx = val_end_idx - VAL_SIZE
+        train_end_idx = val_start_idx
+        
+        if train_end_idx < MIN_TRAIN_SIZE:
+            continue
+            
         train_cutoff = all_dates[train_end_idx - 1]
-        val_start = all_dates[train_end_idx]
+        val_start = all_dates[val_start_idx]
         val_end = all_dates[min(val_end_idx - 1, total_days - 1)]
 
         # DATE MASKING — lọc bằng điều kiện ngày, không dùng iloc
@@ -295,23 +301,30 @@ def _fit_predict_sklearn(
     y_train = df_train[target]
     X_val = df_val[feature_cols]
 
+    # FIX-3a: log-transform target to stabilise variance
+    y_train = np.log1p(y_train)
+    y_val_log = np.log1p(df_val[target])
+
     if model_name in ("lightgbm", "xgboost"):
         model.fit(
             X_train,
             y_train,
-            eval_set=[(X_val, df_val[target])],
+            eval_set=[(X_val, y_val_log)],
             verbose=False
         )
     elif model_name == "catboost":
         model.fit(
             X_train,
             y_train,
-            eval_set=(X_val, df_val[target]),
+            eval_set=(X_val, y_val_log),
         )
     else:
         model.fit(X_train, y_train)
 
-    return model.predict(X_val)
+    preds = model.predict(X_val)
+    # FIX-3b: inverse log-transform predictions
+    preds = np.expm1(preds)
+    return preds
 
 
 def _fit_predict_prophet(
@@ -488,21 +501,49 @@ def train_final_model(
     elif model_name in ("lightgbm", "xgboost", "catboost"):
         X = df[feature_cols]
         y = df[target]
-        # Final train: không có eval_set — tắt early stopping bằng cách fit thẳng
+
+        # FIX-4: carve out a temporal hold-out to re-enable early stopping
+        holdout_n = max(1, int(len(X) * 0.10))
+        X_tr, X_val = X.iloc[:-holdout_n], X.iloc[-holdout_n:]
+        y_tr, y_val = y.iloc[:-holdout_n], y.iloc[-holdout_n:]
+
+        # FIX-3a: log-transform target to stabilise variance
+        y_train_log = np.log1p(y_tr)
+        y_val_log = np.log1p(y_val)
+
         if model_name == "lightgbm":
             from lightgbm import LGBMRegressor
-            # Override early_stopping_rounds để tránh yêu cầu eval_set
+            import lightgbm as lgb
             final_cfg = {k: v for k, v in model_cfg.items() if k != "early_stopping_rounds"}
             model = LGBMRegressor(**final_cfg, random_state=seed)
+            model.fit(
+                X_tr, y_train_log,
+                eval_set=[(X_val, y_val_log)],
+                callbacks=[lgb.early_stopping(50), lgb.log_evaluation(False)]
+            )
         elif model_name == "xgboost":
             from xgboost import XGBRegressor
             final_cfg = {k: v for k, v in model_cfg.items() if k != "early_stopping_rounds"}
+            final_cfg["early_stopping_rounds"] = model_cfg.get("early_stopping_rounds", 50)
             model = XGBRegressor(**final_cfg, random_state=seed, tree_method="hist")
+            model.fit(
+                X_tr, y_train_log,
+                eval_set=[(X_val, y_val_log)],
+                verbose=False
+            )
         elif model_name == "catboost":
             from catboost import CatBoostRegressor
             final_cfg = {k: v for k, v in model_cfg.items() if k != "early_stopping_rounds"}
-            model = CatBoostRegressor(**final_cfg, random_seed=seed)
-        model.fit(X, y)
+            model = CatBoostRegressor(**final_cfg, random_seed=seed, early_stopping_rounds=50)
+            model.fit(
+                X_tr, y_train_log,
+                eval_set=(X_val, y_val_log),
+                verbose=False
+            )
+
+        predictions = model.predict(X)
+        # FIX-3b: inverse log-transform predictions
+        predictions = np.expm1(predictions)
 
     logger.info("Đã huấn luyện final model [%s] cho target '%s'", model_name, target)
     return model
