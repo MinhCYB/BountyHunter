@@ -1,455 +1,760 @@
 """
-================================================================================
-MODULE: TRAINING PIPELINE (HUẤN LUYỆN MÔ HÌNH CUỐI)
-================================================================================
+train.py — Agent 3: Huấn luyện mô hình dự báo Revenue và Margin.
 
-Mục đích:
-    Nhận artifacts đã chuẩn bị từ validation.py, huấn luyện 2 model độc lập
-    (Revenue và COGS), xuất model + feature importance phục vụ báo cáo datathon.
-
-    Module này KHÔNG chạy lại CV, KHÔNG split data, KHÔNG tune hyperparams.
-    Toàn bộ các bước đó đã hoàn tất ở validation.py và model_selection.py.
-    train.py chỉ làm đúng 3 việc:
-        Bước 1 — Load artifacts từ validation.py.
-        Bước 2 — Train 2 model độc lập (Revenue + COGS).
-        Bước 3 — Lưu model + feature_importance.
-
-Lý do train riêng từng target:
-    Revenue và COGS có đặc tính chuỗi thời gian khác nhau:
-    - Revenue biến động mạnh theo mùa vụ, nhạy cảm với promo.
-    - COGS ổn định hơn, gắn chặt với volume và cấu trúc chi phí.
-    Optimal hyperparams của 2 target thường không trùng nhau.
-    Train chung (MultiOutputRegressor) buộc dùng cùng params → suboptimal.
-
-Lý do KHÔNG gọi run_validation() trong module này:
-    Nếu muốn retrain với params mới, chỉ cần chạy lại train.py — không cần
-    tốn thời gian chạy lại toàn bộ CV. Artifacts của validation.py
-    (X_train, y_train, sample_weights) là stable trừ khi feature engineering
-    thay đổi, nên tách biệt hoàn toàn 2 bước.
-
-Cấu hình model:
-    Sau khi chạy model_selection --tune → --apply, train.py tự đọc
-    models/best_params.parquet. Không cần chỉnh chỗ nào khác.
-
-Đầu ra — data/features/:
-    model_Revenue.joblib        — Model đã fit cho target Revenue
-    model_COGS.joblib           — Model đã fit cho target COGS
-    feature_importance.parquet  — Tầm quan trọng feature (quan trọng cho báo cáo)
+Pipeline:
+  1. Load feature_table.parquet
+  2. Expanding Window CV với Date Masking
+  3. Train final model trên toàn bộ tập train
+  4. Lưu model + CV metrics
+  5. (Optional) SHAP report
 """
 
-import pandas as pd
-import numpy as np
-import joblib
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import pickle
 import warnings
-warnings.filterwarnings('ignore')
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Tuple
 
-from src.config import config
+import numpy as np
+import pandas as pd
+import yaml
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from tqdm import tqdm
 
-logger = config.get_logger(__name__)
+warnings.filterwarnings("ignore")
 
-# ── Constants (từ config) ──────────────────────────────────────────────────────
-TARGETS      = config.TARGETS
-RANDOM_STATE = config.RANDOM_STATE
+logger = logging.getLogger(__name__)
 
 
-# ==========================================
-# CẤUHÌNH MODEL — CHỈNH SỬA TẠI ĐÂY SAU KHI ĐỌC comparison_summary.parquet
-# ==========================================
+# ---------------------------------------------------------------------------
+# 1. CLI
+# ---------------------------------------------------------------------------
 
-def _build_chosen_models() -> dict:
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments cho train.py."""
+    parser = argparse.ArgumentParser(description="Huấn luyện mô hình dự báo Revenue và Margin")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config.yaml"),
+        help="Đường dẫn tới file config.yaml",
+    )
+    return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# 2. Config
+# ---------------------------------------------------------------------------
+
+def load_config(path: Path) -> dict:
     """
-    Khởi tạo model cho từng target theo thứ tự ưu tiên:
+    Đọc toàn bộ cấu hình từ config.yaml.
 
-        Ưu tiên 1 — models/best_params.parquet (tự động):
-            Được ghi bởi model_selection.apply_best_params() sau khi Grid Search.
-            Không cần chỉnh tay — chạy --tune → --apply → --train là xong.
-            Persist cross-session: restart Python vẫn đọc được.
+    Parameters
+    ----------
+    path : Path
+        Đường dẫn tới config.yaml.
 
-        Ưu tiên 2 — DEFAULT_PARAMS (hardcode fallback):
-            Dùng khi chưa chạy Grid Search lần nào. Reasonable defaults dựa
-            trên kinh nghiệm với time-series retail data.
-            [Chỉnh tại đây nếu muốn override thủ công.]
-
-    Returns:
-        dict[str, model]: {'Revenue': model_obj, 'COGS': model_obj}
-
-    Raises:
-        ImportError: Nếu thư viện ML chưa được cài đặt.
+    Returns
+    -------
+    dict
+        Dictionary chứa toàn bộ config.
     """
-    import json as _json
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
-    # ── DEFAULT PARAMS (Ưu tiên 3 — fallback) ────────────────────────────────
-    # Chỉnh tại đây nếu muốn override thủ công, không cần Grid Search.
-    DEFAULT_PARAMS = {
-        'Revenue': {
-            'model_class': 'LGBMRegressor',
-            'params': {
-                'n_estimators'     : 1000,
-                'learning_rate'    : 0.03,
-                'num_leaves'       : 127,
-                'min_child_samples': 20,
-                'subsample'        : 0.8,
-                'colsample_bytree' : 0.8,
-                'reg_alpha'        : 0.1,
-                'reg_lambda'       : 0.1,
-            }
-        },
-        'COGS': {
-            'model_class': 'LGBMRegressor',
-            'params': {
-                # COGS ổn định hơn → shallower tree, ít regularization hơn
-                'n_estimators'     : 800,
-                'learning_rate'    : 0.03,
-                'num_leaves'       : 63,
-                'min_child_samples': 20,
-                'subsample'        : 0.8,
-                'colsample_bytree' : 0.8,
-                'reg_alpha'        : 0.05,
-                'reg_lambda'       : 0.05,
-            }
-        },
-    }
 
-    # ── Resolve params theo thứ tự ưu tiên ───────────────────────────────────
-    # Ưu tiên 1: models/best_params.parquet (output của model_selection --apply)
-    # Ưu tiên 2: DEFAULT_PARAMS hardcode (fallback khi chưa chạy grid search)
-    best_params_path = config.MODELS / 'best_params.parquet'
-    tuned = {}
+# ---------------------------------------------------------------------------
+# 3. Data Loading
+# ---------------------------------------------------------------------------
 
-    if best_params_path.exists():
-        bp_df = pd.read_parquet(best_params_path)
-        for _, row in bp_df.iterrows():
-            tuned[row['target']] = {
-                'model_class': row['model_class'],
-                'params'     : _json.loads(row['params_json']),
-            }
-        logger.info(f"   Loaded tuned params từ {best_params_path}")
-        logger.info(f"   Promoted at: {bp_df['promoted_at'].iloc[0]}")
+def load_feature_table(processed_dir: Path) -> pd.DataFrame:
+    """
+    Load train_features.parquet từ thư mục processed.
 
-    resolved = tuned if tuned else DEFAULT_PARAMS
-    source   = f"best_params.parquet (Grid Search — promoted {bp_df['promoted_at'].iloc[0][:10]})" if tuned else "DEFAULT_PARAMS (fallback — chưa chạy grid search)"
-    logger.info(f"   Params source: {source}")
+    Parameters
+    ----------
+    processed_dir : Path
+        Thư mục chứa train_features.parquet.
 
-    # ── Model registry ────────────────────────────────────────────────────────
-    registry = {}
-    try:
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame đã sắp xếp theo cột date tăng dần.
+    """
+    path = processed_dir / "train_features.parquet"
+    df = pd.read_parquet(path)
+    df = df.sort_values("date").reset_index(drop=True)
+    logger.info("Đã load train_features: %d dòng, %d cột", len(df), df.shape[1])
+    return df
+
+
+def get_feature_cols(
+    df: pd.DataFrame,
+    target_cols: List[str],
+    date_col: str,
+) -> List[str]:
+    """
+    Lấy danh sách cột feature (loại bỏ target và date).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame đầy đủ.
+    target_cols : List[str]
+        Danh sách cột target cần loại bỏ.
+    date_col : str
+        Tên cột date cần loại bỏ.
+
+    Returns
+    -------
+    List[str]
+        Danh sách tên cột dùng làm feature.
+    """
+    exclude = set(target_cols) | {date_col}
+    feature_cols = [c for c in df.columns if c not in exclude]
+    logger.info("Số feature columns: %d", len(feature_cols))
+    return feature_cols
+
+
+# ---------------------------------------------------------------------------
+# 4. Model Registry
+# ---------------------------------------------------------------------------
+
+def get_model(model_name: str, model_cfg: dict, seed: int) -> Any:
+    """
+    Factory trả về model object từ tên và config.
+
+    Parameters
+    ----------
+    model_name : str
+        Tên model: lightgbm | xgboost | catboost | prophet.
+    model_cfg : dict
+        Hyperparameter dict từ config.yaml.
+    seed : int
+        Random seed để đảm bảo reproducibility.
+
+    Returns
+    -------
+    Any
+        Model object phù hợp với model_name.
+
+    Raises
+    ------
+    ValueError
+        Nếu model_name không được hỗ trợ.
+    """
+    if model_name == "lightgbm":
         from lightgbm import LGBMRegressor
-        registry['LGBMRegressor'] = LGBMRegressor
-    except ImportError:
-        pass
-    try:
-        from xgboost import XGBRegressor
-        registry['XGBRegressor'] = XGBRegressor
-    except ImportError:
-        pass
-    try:
-        from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-        registry['RandomForestRegressor']    = RandomForestRegressor
-        registry['GradientBoostingRegressor']= GradientBoostingRegressor
-    except ImportError:
-        pass
+        return LGBMRegressor(**model_cfg, random_state=seed)
 
-    if not registry:
-        raise ImportError(
-            "Không có thư viện ML nào. Cài: pip install lightgbm xgboost scikit-learn"
+    elif model_name == "xgboost":
+        from xgboost import XGBRegressor
+        return XGBRegressor(**model_cfg, random_state=seed, tree_method="hist")
+
+    elif model_name == "catboost":
+        from catboost import CatBoostRegressor
+        return CatBoostRegressor(**model_cfg, random_seed=seed)
+
+    elif model_name == "prophet":
+        from prophet import Prophet
+        # Loại bỏ các key không thuộc Prophet constructor
+        prophet_cfg = {k: v for k, v in model_cfg.items()}
+        return Prophet(**prophet_cfg)
+
+    else:
+        raise ValueError(f"Model không hỗ trợ: {model_name}")
+
+
+# ---------------------------------------------------------------------------
+# 5. Cross-Validation — Expanding Window với Date Masking
+# ---------------------------------------------------------------------------
+
+def expanding_window_cv(
+    df: pd.DataFrame,
+    date_col: str,
+    n_splits: int,
+    min_train_days: int,
+) -> Iterator[Tuple[pd.DataFrame, pd.DataFrame]]:
+    """
+    Tạo các fold Expanding Window CV bằng Date Masking.
+
+    Lọc DataFrame bằng điều kiện trên cột date (không dùng integer index)
+    để tránh lệch index khi tập dữ liệu có ngày bị thiếu.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame đã sắp xếp theo date_col tăng dần.
+    date_col : str
+        Tên cột date (dtype datetime64).
+    n_splits : int
+        Số fold CV.
+    min_train_days : int
+        Số ngày tối thiểu trong tập train của fold đầu tiên.
+
+    Yields
+    ------
+    Tuple[pd.DataFrame, pd.DataFrame]
+        Mỗi fold là cặp (df_train, df_val).
+    """
+    all_dates = df[date_col].sort_values().unique()
+    total_days = len(all_dates)
+
+    val_size = (total_days - min_train_days) // n_splits
+
+    for fold in range(n_splits):
+        train_end_idx = min_train_days + fold * val_size
+        val_end_idx = train_end_idx + val_size
+
+        train_cutoff = all_dates[train_end_idx - 1]
+        val_start = all_dates[train_end_idx]
+        val_end = all_dates[min(val_end_idx - 1, total_days - 1)]
+
+        # DATE MASKING — lọc bằng điều kiện ngày, không dùng iloc
+        df_train = df[df[date_col] <= train_cutoff].copy()
+        df_val = df[
+            (df[date_col] >= val_start) & (df[date_col] <= val_end)
+        ].copy()
+
+        logger.debug(
+            "Fold %d: train đến %s | val %s – %s | train_size=%d val_size=%d",
+            fold + 1,
+            train_cutoff,
+            val_start,
+            val_end,
+            len(df_train),
+            len(df_val),
         )
 
-    # ── Khởi tạo model cho từng target ───────────────────────────────────────
-    models = {}
-    for target in TARGETS:
-        spec         = resolved.get(target, DEFAULT_PARAMS.get(target, {}))
-        class_name   = spec.get('model_class', 'LGBMRegressor')
-        params       = spec.get('params', {})
+        yield df_train, df_val
 
-        if class_name not in registry:
-            raise ImportError(
-                f"Model class '{class_name}' cho target [{target}] chưa được cài đặt."
+
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    """
+    Tính MAE, RMSE, R² giữa giá trị thực và dự báo.
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+        Giá trị thực tế.
+    y_pred : np.ndarray
+        Giá trị dự báo.
+
+    Returns
+    -------
+    Dict[str, float]
+        Dictionary với keys: mae, rmse, r2.
+    """
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    r2 = r2_score(y_true, y_pred)
+    return {"mae": mae, "rmse": rmse, "r2": r2}
+
+
+def _fit_predict_sklearn(
+    model: Any,
+    df_train: pd.DataFrame,
+    df_val: pd.DataFrame,
+    feature_cols: List[str],
+    target: str,
+    model_name: str,
+    cfg: dict,
+) -> np.ndarray:
+    """
+    Fit model sklearn-compatible và predict trên df_val.
+
+    Parameters
+    ----------
+    model : Any
+        Model object (LightGBM / XGBoost / CatBoost).
+    df_train : pd.DataFrame
+        Tập huấn luyện của fold.
+    df_val : pd.DataFrame
+        Tập validation của fold.
+    feature_cols : List[str]
+        Danh sách cột feature.
+    target : str
+        Tên cột target.
+    model_name : str
+        Tên model (để xử lý early stopping đúng cách).
+    cfg : dict
+        Config đầy đủ.
+
+    Returns
+    -------
+    np.ndarray
+        Mảng dự báo trên tập validation.
+    """
+    X_train = df_train[feature_cols]
+    y_train = df_train[target]
+    X_val = df_val[feature_cols]
+
+    if model_name in ("lightgbm", "xgboost"):
+        model.fit(
+            X_train,
+            y_train,
+            eval_set=[(X_val, df_val[target])],
+        )
+    elif model_name == "catboost":
+        model.fit(
+            X_train,
+            y_train,
+            eval_set=(X_val, df_val[target]),
+        )
+    else:
+        model.fit(X_train, y_train)
+
+    return model.predict(X_val)
+
+
+def _fit_predict_prophet(
+    model: Any,
+    df_train: pd.DataFrame,
+    df_val: pd.DataFrame,
+    feature_cols: List[str],
+    target: str,
+) -> np.ndarray:
+    """
+    Fit Prophet và predict trên df_val.
+
+    Rename cột thành 'ds'/'y', thêm external regressors.
+
+    Parameters
+    ----------
+    model : Any
+        Prophet model object.
+    df_train : pd.DataFrame
+        Tập huấn luyện với cột date và target.
+    df_val : pd.DataFrame
+        Tập validation.
+    feature_cols : List[str]
+        Danh sách cột regressor bổ sung.
+    target : str
+        Tên cột target.
+
+    Returns
+    -------
+    np.ndarray
+        Mảng dự báo trên tập validation.
+    """
+    # Chuẩn bị tập train cho Prophet
+    train_prophet = df_train[["date", target] + feature_cols].rename(
+        columns={"date": "ds", target: "y"}
+    )
+    for col in feature_cols:
+        model.add_regressor(col)
+
+    model.fit(train_prophet)
+
+    # Chuẩn bị tập val
+    val_prophet = df_val[["date"] + feature_cols].rename(columns={"date": "ds"})
+    forecast = model.predict(val_prophet)
+    return forecast["yhat"].values
+
+
+def run_cv(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    target: str,
+    cfg: dict,
+) -> Dict[str, Any]:
+    """
+    Chạy Expanding Window CV, tính metrics cho từng fold và trung bình.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame với đầy đủ feature và target.
+    feature_cols : List[str]
+        Danh sách cột feature.
+    target : str
+        Tên cột target ('revenue' hoặc 'margin').
+    cfg : dict
+        Config đầy đủ từ config.yaml.
+
+    Returns
+    -------
+    Dict[str, Any]
+        Dictionary chứa metrics từng fold và mean/std.
+    """
+    cv_cfg = cfg["cv"]
+    model_name: str = cfg["models"]["active"]
+    seed: int = cfg["models"]["random_seed"]
+    model_cfg: dict = cfg["models"][model_name]
+
+    n_splits: int = cv_cfg["n_splits"]
+    min_train_days: int = cv_cfg["min_train_days"]
+
+    fold_metrics: List[Dict[str, float]] = []
+
+    cv_gen = expanding_window_cv(df, "date", n_splits, min_train_days)
+
+    for fold_idx, (df_train, df_val) in enumerate(
+        tqdm(cv_gen, desc=f"CV [{target}]", total=n_splits)
+    ):
+        model = get_model(model_name, model_cfg, seed)
+
+        if model_name == "prophet":
+            y_pred = _fit_predict_prophet(model, df_train, df_val, feature_cols, target)
+        else:
+            y_pred = _fit_predict_sklearn(
+                model, df_train, df_val, feature_cols, target, model_name, cfg
             )
 
-        model_cls = registry[class_name]
-        try:
-            model = model_cls(
-                **params,
-                random_state = RANDOM_STATE,
-                n_jobs       = -1,
-                verbosity    = -1,
-            )
-        except TypeError:
-            # Fallback: model không nhận verbosity hoặc n_jobs
-            try:
-                model = model_cls(**params, random_state=RANDOM_STATE, n_jobs=-1)
-            except TypeError:
-                model = model_cls(**params, random_state=RANDOM_STATE)
+        y_true = df_val[target].values
+        metrics = compute_metrics(y_true, y_pred)
+        fold_metrics.append(metrics)
 
-        models[target] = model
-        logger.info(f"   [{target}] {class_name} | params={params}")
+        logger.info(
+            "Fold %d [%s] — MAE=%.4f | RMSE=%.4f | R²=%.4f",
+            fold_idx + 1,
+            target,
+            metrics["mae"],
+            metrics["rmse"],
+            metrics["r2"],
+        )
 
-    return models
+    # Tính mean và std qua các fold
+    keys = ["mae", "rmse", "r2"]
+    mean_metrics = {k: float(np.mean([m[k] for m in fold_metrics])) for k in keys}
+    std_metrics = {k: float(np.std([m[k] for m in fold_metrics])) for k in keys}
 
+    logger.info(
+        "CV [%s] MEAN — MAE=%.4f | RMSE=%.4f | R²=%.4f",
+        target,
+        mean_metrics["mae"],
+        mean_metrics["rmse"],
+        mean_metrics["r2"],
+    )
 
-# ==========================================
-# BƯỚC 1: LOAD ARTIFACTS
-# ==========================================
-
-def _load_training_artifacts() -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray]:
-    """
-    Đọc X_train, y_train, sample_weights từ validation artifacts.
-
-    Không rebuild, không retransform — đọc thẳng parquet đã sẵn sàng.
-    Nếu artifacts chưa tồn tại, raise lỗi rõ ràng với hướng dẫn khắc phục.
-
-    Returns:
-        X_train (pd.DataFrame)   : Feature matrix đã impute + scale.
-        y_train (pd.DataFrame)   : Target vector (Date, Revenue, COGS).
-        sample_weights (np.ndarray): Sample weight từng ngày train.
-
-    Raises:
-        FileNotFoundError: Nếu một trong các artifact chưa tồn tại.
-    """
-    required = {
-        'X_train'       : config.FEATURES / 'X_train.parquet',
-        'y_train'       : config.FEATURES / 'y_train.parquet',
-        'sample_weights': config.FEATURES / 'sample_weights.parquet',
+    return {
+        "target": target,
+        "model": model_name,
+        "fold_metrics": fold_metrics,
+        "mean": mean_metrics,
+        "std": std_metrics,
     }
 
-    missing = [k for k, p in required.items() if not p.exists()]
-    if missing:
-        raise FileNotFoundError(
-            f"Chưa tìm thấy artifacts: {missing}.\n"
-            f"Hãy chạy validation pipeline trước: python main.py --feat (rồi validation)."
-        )
 
-    X_train        = pd.read_parquet(required['X_train'])
-    y_train        = pd.read_parquet(required['y_train'])
-    sw_df          = pd.read_parquet(required['sample_weights'])
-    sample_weights = sw_df['sample_weight'].values
+# ---------------------------------------------------------------------------
+# 6. Final Training
+# ---------------------------------------------------------------------------
 
-    logger.info(f"   X_train        : {X_train.shape}")
-    logger.info(f"   y_train        : {y_train.shape}")
-    logger.info(f"   sample_weights : shape={sample_weights.shape} | "
-                f"min={sample_weights.min():.3f} | mean={sample_weights.mean():.3f}")
-
-    return X_train, y_train, sample_weights
-
-
-# ==========================================
-# BƯỚC 2: TRAIN MỖI TARGET ĐỘC LẬP
-# ==========================================
-
-def _train_single_target(
-    model,
-    X_train        : pd.DataFrame,
-    y_train        : pd.Series,
-    sample_weights : np.ndarray,
-    target_name    : str,
-) -> object:
+def train_final_model(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    target: str,
+    cfg: dict,
+) -> Any:
     """
-    Fit một model cho một target cụ thể với sample weights.
+    Huấn luyện model cuối trên toàn bộ tập train.
 
-    Truyền sample_weight qua fit() thay vì constructor để tương thích với
-    cả LightGBM, XGBoost và sklearn API. Với sklearn models không hỗ trợ
-    sample_weight, sẽ fallback về fit không weight và log cảnh báo.
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Toàn bộ feature_table (chỉ phần train).
+    feature_cols : List[str]
+        Danh sách cột feature.
+    target : str
+        Tên cột target.
+    cfg : dict
+        Config đầy đủ.
 
-    Args:
-        model          : Model instance chưa fit (từ _build_chosen_models()).
-        X_train        : Feature matrix.
-        y_train        : Target series (1 cột).
-        sample_weights : Weight từng mẫu.
-        target_name    : Tên target — dùng cho log và tên file.
-
-    Returns:
+    Returns
+    -------
+    Any
         Model đã fit.
     """
-    logger.info(f"   Fit model cho target: [{target_name}]")
-    logger.info(f"   Samples: {len(X_train)} | Features: {X_train.shape[1]}")
+    model_name: str = cfg["models"]["active"]
+    seed: int = cfg["models"]["random_seed"]
+    model_cfg: dict = cfg["models"][model_name]
 
-    try:
-        model.fit(X_train, y_train, sample_weight=sample_weights)
-        logger.info(f"   [{target_name}] Fit thành công ✅ (có sample_weight)")
-    except TypeError:
-        # Fallback: một số sklearn models không nhận sample_weight trong fit()
-        logger.warning(
-            f"   [{target_name}] Model không hỗ trợ sample_weight → fit không weight."
+    model = get_model(model_name, model_cfg, seed)
+
+    if model_name == "prophet":
+        train_prophet = df[["date", target] + feature_cols].rename(
+            columns={"date": "ds", target: "y"}
         )
-        model.fit(X_train, y_train)
-        logger.info(f"   [{target_name}] Fit thành công ✅ (không sample_weight)")
+        for col in feature_cols:
+            model.add_regressor(col)
+        model.fit(train_prophet)
+    elif model_name in ("lightgbm", "xgboost", "catboost"):
+        X = df[feature_cols]
+        y = df[target]
+        # Final train: không có eval_set — tắt early stopping bằng cách fit thẳng
+        if model_name == "lightgbm":
+            from lightgbm import LGBMRegressor
+            # Override early_stopping_rounds để tránh yêu cầu eval_set
+            final_cfg = {k: v for k, v in model_cfg.items() if k != "early_stopping_rounds"}
+            model = LGBMRegressor(**final_cfg, random_state=seed)
+        elif model_name == "xgboost":
+            from xgboost import XGBRegressor
+            final_cfg = {k: v for k, v in model_cfg.items() if k != "early_stopping_rounds"}
+            model = XGBRegressor(**final_cfg, random_state=seed, tree_method="hist")
+        elif model_name == "catboost":
+            from catboost import CatBoostRegressor
+            final_cfg = {k: v for k, v in model_cfg.items() if k != "early_stopping_rounds"}
+            model = CatBoostRegressor(**final_cfg, random_seed=seed)
+        model.fit(X, y)
 
+    logger.info("Đã huấn luyện final model [%s] cho target '%s'", model_name, target)
     return model
 
 
-# ==========================================
-# BƯỚC 3: XUẤT FEATURE IMPORTANCE
-# ==========================================
+# ---------------------------------------------------------------------------
+# 7. Save / Load Utilities
+# ---------------------------------------------------------------------------
 
-def _extract_feature_importance(
-    models       : dict,
-    feature_cols : list[str],
-) -> pd.DataFrame:
+def save_model(model: Any, path: Path) -> None:
     """
-    Tổng hợp feature importance từ tất cả model đã train.
+    Lưu model object vào file .pkl bằng pickle.
 
-    Hỗ trợ 2 loại importance API:
-        - feature_importances_ (LightGBM, XGBoost, RandomForest, GBM): gain-based.
-        - coef_ (LinearRegression, Ridge, Lasso): hệ số hồi quy (abs value).
-
-    Nếu model không có cả hai, cột importance sẽ là NaN — không crash.
-
-    Cột đầu ra:
-        feature_name  : Tên feature.
-        importance_{target} : Score importance cho từng target.
-        importance_mean     : Trung bình giữa các target (dùng cho báo cáo tổng).
-        rank_mean           : Rank theo importance_mean (1 = quan trọng nhất).
-        group               : Nhóm feature (calendar / yoy / seasonal / promo),
-                              join từ feature_metadata.parquet nếu có.
-
-    Args:
-        models       (dict[str, model]): Model đã fit theo target.
-        feature_cols (list[str])       : Tên feature theo đúng thứ tự trong X_train.
-
-    Returns:
-        pd.DataFrame: Feature importance đã rank, sẵn sàng cho báo cáo.
+    Parameters
+    ----------
+    model : Any
+        Model đã fit.
+    path : Path
+        Đường dẫn file đầu ra (.pkl).
     """
-    importance_df = pd.DataFrame({'feature_name': feature_cols})
-
-    for target, model in models.items():
-        col_name = f'importance_{target}'
-        if hasattr(model, 'feature_importances_'):
-            importance_df[col_name] = model.feature_importances_
-        elif hasattr(model, 'coef_'):
-            importance_df[col_name] = np.abs(model.coef_)
-        else:
-            logger.warning(f"   [{target}] Model không có feature_importances_ hoặc coef_.")
-            importance_df[col_name] = np.nan
-
-    # Tính trung bình và rank
-    imp_cols = [f'importance_{t}' for t in models.keys() if f'importance_{t}' in importance_df.columns]
-    importance_df['importance_mean'] = importance_df[imp_cols].mean(axis=1)
-    importance_df = importance_df.sort_values('importance_mean', ascending=False).reset_index(drop=True)
-    importance_df.insert(1, 'rank_mean', range(1, len(importance_df) + 1))
-
-    # Gắn thêm nhóm feature nếu có metadata
-    meta_path = config.FEATURES / 'feature_metadata.parquet'
-    if meta_path.exists():
-        meta = pd.read_parquet(meta_path)[['feature_name', 'group']]
-        importance_df = importance_df.merge(meta, on='feature_name', how='left')
-        importance_df['group'] = importance_df['group'].fillna('unknown')
-    else:
-        logger.warning("   feature_metadata.parquet chưa có — cột 'group' sẽ bị bỏ qua.")
-
-    logger.info(f"\n  Top 10 features theo importance_mean:")
-    for _, row in importance_df.head(10).iterrows():
-        imp_vals = " | ".join(
-            f"{t}={row[f'importance_{t}']:>8.1f}"
-            for t in models.keys()
-            if f'importance_{t}' in row.index
-        )
-        group = row.get('group', '?')
-        logger.info(f"    #{int(row['rank_mean']):>3} [{group:<8}] {row['feature_name']:<40} {imp_vals}")
-
-    return importance_df
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(model, f)
+    logger.info("Đã lưu model: %s", path)
 
 
-# ==========================================
-# ORCHESTRATOR
-# ==========================================
-
-def run_train(force_retrain: bool = False) -> dict:
+def save_feature_cols(feature_cols: List[str], path: Path) -> None:
     """
-    Entry point chính — thực thi toàn bộ Training Pipeline.
+    Lưu danh sách feature columns ra file JSON để inference dùng lại.
 
-    - force_retrain=False (default): Bỏ qua nếu model_Revenue.joblib đã tồn tại.
-    - force_retrain=True           : Train lại từ đầu dù artifact đã có.
+    Đảm bảo inference dùng đúng thứ tự và tập cột mà model đã train.
 
-    Thứ tự:
-        1. Kiểm tra artifact đã tồn tại chưa.
-        2. Load X_train, y_train, sample_weights.
-        3. Khởi tạo model theo CHOSEN_MODELS.
-        4. Train riêng từng target.
-        5. Xuất model.joblib + feature_importance.parquet.
-
-    Args:
-        force_retrain (bool): Mặc định False để tránh train lại vô ý.
-
-    Returns:
-        dict[str, model]: Model đã fit theo từng target.
-
-    Raises:
-        FileNotFoundError: Nếu artifacts chưa tồn tại.
+    Parameters
+    ----------
+    feature_cols : List[str]
+        Danh sách tên cột feature theo thứ tự train.
+    path : Path
+        Đường dẫn file đầu ra (feature_cols.json).
     """
-    logger.info("=" * 60)
-    logger.info("BẮT ĐẦU TRAINING PIPELINE")
-    logger.info("=" * 60)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(feature_cols, f, indent=2, ensure_ascii=False)
+    logger.info("Đã lưu feature_cols (%d cột): %s", len(feature_cols), path)
 
-    rev_model_path = config.FEATURES / 'model_Revenue.joblib'
 
-    if not force_retrain and rev_model_path.exists():
-        logger.info(
-            "Model đã tồn tại. Bỏ qua để tiết kiệm thời gian "
-            "(đặt force_retrain=True để train lại)."
-        )
-        # Load và trả về model đã có để inference có thể dùng
-        fitted_models = {}
-        for target in TARGETS:
-            path = config.FEATURES / f'model_{target}.joblib'
-            if path.exists():
-                fitted_models[target] = joblib.load(path)
-                logger.info(f"   Load model [{target}] từ cache ✅")
-        return fitted_models
+def save_cv_metrics(metrics: Dict[str, Any], path: Path) -> None:
+    """
+    Lưu CV metrics ra file JSON.
 
-    # ── Bước 1: Load artifacts ────────────────────────────────────────────────
-    logger.info("\nBước 1 — Load training artifacts...")
-    X_train, y_train, sample_weights = _load_training_artifacts()
+    Parameters
+    ----------
+    metrics : Dict[str, Any]
+        Dictionary metrics từ run_cv.
+    path : Path
+        Đường dẫn file đầu ra (.json).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
+    logger.info("Đã lưu CV metrics: %s", path)
 
-    feature_cols = list(X_train.columns)
 
-    # ── Bước 2: Khởi tạo model đã chọn ───────────────────────────────────────
-    logger.info("\nBước 2 — Khởi tạo model (từ best_params.parquet hoặc DEFAULT_PARAMS)...")
-    chosen_models = _build_chosen_models()
-    logger.info(f"   Targets sẽ train: {list(chosen_models.keys())}")
+# ---------------------------------------------------------------------------
+# 8. SHAP
+# ---------------------------------------------------------------------------
 
-    # ── Bước 3: Train từng target ─────────────────────────────────────────────
-    logger.info("\nBước 3 — Train model cho từng target...")
-    fitted_models = {}
+def compute_shap(
+    model: Any,
+    X_sample: pd.DataFrame,
+    cfg: dict,
+    output_dir: Path,
+    target: str,
+) -> None:
+    """
+    Tính SHAP values và xuất report (html hoặc png).
 
-    for target in TARGETS:
-        if target not in chosen_models:
-            logger.warning(f"   [{target}] Không có trong resolved params — bỏ qua.")
-            continue
-        if target not in y_train.columns:
-            logger.error(f"   [{target}] Không có trong y_train — bỏ qua.")
-            continue
+    Chỉ hỗ trợ tree-based models (LightGBM, XGBoost, CatBoost).
+    Prophet sẽ bị bỏ qua với cảnh báo.
 
-        y_target = y_train[target].values
-        model    = chosen_models[target]
+    Parameters
+    ----------
+    model : Any
+        Model đã fit.
+    X_sample : pd.DataFrame
+        Sample dữ liệu để tính SHAP (đã giới hạn số dòng).
+    cfg : dict
+        Config đầy đủ.
+    output_dir : Path
+        Thư mục lưu output.
+    target : str
+        Tên target (để đặt tên file).
+    """
+    import shap
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
-        fitted_model = _train_single_target(
-            model          = model,
-            X_train        = X_train,
-            y_train        = y_target,
-            sample_weights = sample_weights,
-            target_name    = target,
-        )
-        fitted_models[target] = fitted_model
+    model_name: str = cfg["models"]["active"]
+    output_format: str = cfg["explainability"]["output_format"]
 
-    # ── Bước 4: Xuất model.joblib + feature_importance ────────────────────────
-    logger.info("\nBước 4 — Lưu model và feature importance...")
-    config.FEATURES.mkdir(parents=True, exist_ok=True)
+    if model_name == "prophet":
+        logger.warning("SHAP không hỗ trợ Prophet — bỏ qua bước SHAP cho target '%s'", target)
+        return
 
-    for target, model in fitted_models.items():
-        out_path = config.FEATURES / f'model_{target}.joblib'
-        joblib.dump(model, out_path)
-        logger.info(f"   Đã lưu: {out_path}")
+    try:
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_sample)
 
-    importance_df = _extract_feature_importance(fitted_models, feature_cols)
-    importance_path = config.FEATURES / 'feature_importance.parquet'
-    importance_df.to_parquet(importance_path, index=False)
-    logger.info(f"   Đã lưu: {importance_path}")
+        # Top 10 feature theo mean |SHAP|
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+        top10_idx = np.argsort(mean_abs_shap)[::-1][:10]
+        top10_features = [(X_sample.columns[i], mean_abs_shap[i]) for i in top10_idx]
 
-    logger.info("\n" + "=" * 60)
-    logger.info("TRAINING PIPELINE HOÀN TẤT ✅")
-    logger.info(f"  Models    : {[f'model_{t}.joblib' for t in fitted_models]}")
-    logger.info(f"  Importance: feature_importance.parquet ({len(importance_df)} features)")
-    logger.info(f"  Output    : {config.FEATURES}")
-    logger.info("=" * 60)
+        logger.info("Top 10 SHAP features [%s]:", target)
+        for feat, val in top10_features:
+            logger.info("  %-40s %.4f", feat, val)
 
-    return fitted_models
+        # Xuất plot
+        fig, ax = plt.subplots(figsize=(10, 6))
+        shap.summary_plot(shap_values, X_sample, show=False)
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        if output_format == "html":
+            # Lưu dưới dạng HTML qua matplotlib + base64
+            import io
+            import base64
+
+            buf = io.BytesIO()
+            plt.savefig(buf, format="png", bbox_inches="tight")
+            buf.seek(0)
+            img_b64 = base64.b64encode(buf.read()).decode("utf-8")
+            plt.close()
+
+            html_path = output_dir / f"shap_report_{target}.html"
+            html_content = f"""<!DOCTYPE html>
+<html><head><title>SHAP Report — {target}</title></head>
+<body>
+<h2>SHAP Summary Plot — {target}</h2>
+<img src="data:image/png;base64,{img_b64}" style="max-width:100%"/>
+<h3>Top 10 Features (mean |SHAP|)</h3>
+<ol>
+{"".join(f"<li><b>{f}</b>: {v:.4f}</li>" for f, v in top10_features)}
+</ol>
+</body></html>"""
+            html_path.write_text(html_content, encoding="utf-8")
+            logger.info("Đã lưu SHAP report: %s", html_path)
+
+        else:  # png
+            png_path = output_dir / f"shap_report_{target}.png"
+            plt.savefig(png_path, bbox_inches="tight", dpi=150)
+            plt.close()
+            logger.info("Đã lưu SHAP report: %s", png_path)
+
+    except Exception as exc:
+        logger.warning("Không thể tính SHAP cho target '%s': %s", target, exc)
+
+
+# ---------------------------------------------------------------------------
+# 9. Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """
+    Điểm vào chính của train.py.
+
+    Luồng:
+      1. Parse args, load config
+      2. Load feature_table, lọc tập train
+      3. CV cho revenue và margin
+      4. Train final model cho cả hai target
+      5. Save model + metrics
+      6. (Optional) SHAP
+    """
+    args = parse_args()
+    cfg = load_config(args.config)
+
+    # Setup logging
+    log_dir = Path(cfg["paths"]["log_dir"])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"pipeline_{datetime.now():%Y%m%d_%H%M%S}.log"
+    logging.basicConfig(
+        level=getattr(logging, cfg["logging"]["level"]),
+        format=cfg["logging"]["format"],
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+
+    processed_dir = Path(cfg["paths"]["processed_dir"])
+    model_dir = Path(cfg["paths"]["model_dir"])
+    output_dir = Path(cfg["paths"]["output_dir"])
+
+    target_revenue: str = cfg["data"]["target_revenue"]
+    target_margin: str = cfg["data"]["target_margin"]
+    target_cogs: str = cfg["data"]["target_cogs"]
+    date_col: str = cfg["data"]["date_col"]
+
+    TARGET_COLS = [target_revenue, target_margin, target_cogs]
+
+    # Load và lọc tập train theo Date Masking
+    df = load_feature_table(processed_dir)
+    train_end = pd.Timestamp(cfg["data"]["train_end"])
+    df_train_full = df[df["date"] <= train_end].copy()
+    logger.info(
+        "Tập train: %d dòng (%s → %s)",
+        len(df_train_full),
+        df_train_full["date"].min().date(),
+        df_train_full["date"].max().date(),
+    )
+
+    feature_cols = get_feature_cols(df_train_full, TARGET_COLS, "date")
+
+    model_name: str = cfg["models"]["active"]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = model_dir / f"{model_name}_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    all_cv_metrics: Dict[str, Any] = {}
+
+    # ---- CV + Final training cho từng target ----
+    for target in (target_revenue, target_margin):
+        logger.info("=" * 60)
+        logger.info("Bắt đầu CV cho target: %s", target)
+
+        cv_result = run_cv(df_train_full, feature_cols, target, cfg)
+        all_cv_metrics[target] = cv_result
+
+        logger.info("Bắt đầu final training cho target: %s", target)
+        final_model = train_final_model(df_train_full, feature_cols, target, cfg)
+
+        model_filename = f"model_{target}.pkl"
+        save_model(final_model, run_dir / model_filename)
+
+        # SHAP
+        if cfg["explainability"]["shap_enabled"] and model_name != "prophet":
+            seed: int = cfg["models"]["random_seed"]
+            shap_n: int = cfg["explainability"]["shap_sample_size"]
+            X_sample = df_train_full[feature_cols].sample(
+                n=min(shap_n, len(df_train_full)),
+                random_state=seed,
+            )
+            compute_shap(final_model, X_sample, cfg, output_dir, target)
+
+    # Lưu feature_cols để inference load lại đúng thứ tự
+    save_feature_cols(feature_cols, run_dir / "feature_cols.json")
+
+    # Lưu CV metrics
+    save_cv_metrics(all_cv_metrics, run_dir / "cv_metrics.json")
+
+    logger.info("Pipeline train hoàn tất. Model lưu tại: %s", run_dir)
+
+
+if __name__ == "__main__":
+    main()

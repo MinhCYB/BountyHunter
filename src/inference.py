@@ -1,384 +1,482 @@
 """
-================================================================================
-MODULE: INFERENCE PIPELINE (DỰ ĐOÁN VÀ XUẤT SUBMISSION)
-================================================================================
+inference.py — Agent 3: Dự báo Revenue và Margin cho tập test, xuất submission.csv.
 
-Mục đích:
-    Nhận artifacts từ train.py (model_Revenue.joblib, model_COGS.joblib) và
-    validation.py (X_test.parquet), chạy predict, xuất submission.csv đúng
-    format đề bài và một bản diagnostics để kiểm tra sanity trước khi nộp.
-
-    Module này KHÔNG transform lại data, KHÔNG fit thêm bất cứ thứ gì.
-    Mọi imputation và scaling đã hoàn tất trong validation.py.
-    inference.py chỉ làm đúng 3 việc:
-        Bước 1 — Load model + X_test artifacts.
-        Bước 2 — Predict từng target, clip về miền hợp lệ.
-        Bước 3 — Assemble + validate + xuất submission.csv.
-
-Thiết kế clip predictions:
-    Revenue và COGS không thể âm về mặt nghiệp vụ.
-    clip(lower=0) là hard constraint, không phải tuning choice.
-    Dùng np.maximum thay vì pd.clip để rõ intent.
-
-Post-prediction sanity checks:
-    1. Không có NaN trong predictions.
-    2. Mọi giá trị >= 0 (revenue/cost không âm).
-    3. Revenue >= COGS (gross margin dương) — cảnh báo nếu vi phạm.
-    4. Thứ tự ngày đúng với TEST_START → TEST_END.
-    5. Số dòng khớp với date spine test.
-
-Đầu ra:
-    submissions/submission.csv        — File nộp bài chính thức
-    submissions/submission_diag.csv   — Diagnostics: predictions + train stats cho sanity check
+Pipeline:
+  1. Load model_revenue.pkl và model_margin.pkl từ thư mục model mới nhất
+  2. Load feature_table.parquet, lọc tập test bằng Date Masking
+  3. Predict revenue và margin
+  4. Tính COGS = Revenue × Margin
+  5. Sắp xếp theo thứ tự của sample_submission.csv
+  6. Validate và xuất outputs/submission.csv
 """
 
+from __future__ import annotations
+
+import argparse
+import logging
+import pickle
+from datetime import datetime
+from pathlib import Path
+from typing import Any, List, Tuple
+
 import pandas as pd
-import numpy as np
-import joblib
-import warnings
-warnings.filterwarnings('ignore')
+import yaml
 
-from src.config import config
-
-logger = config.get_logger(__name__)
-
-# ── Constants (từ config) ──────────────────────────────────────────────────────
-TARGETS    = config.TARGETS
-TEST_START = config.TEST_START
-TEST_END   = config.TEST_END
+logger = logging.getLogger(__name__)
 
 
-# ==========================================
-# BƯỚC 1: LOAD ARTIFACTS
-# ==========================================
+# ---------------------------------------------------------------------------
+# 1. CLI
+# ---------------------------------------------------------------------------
 
-def _load_inference_artifacts() -> tuple[pd.DataFrame, dict]:
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments cho inference.py."""
+    parser = argparse.ArgumentParser(
+        description="Inference: dự báo Revenue và Margin cho tập test"
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config.yaml"),
+        help="Đường dẫn tới file config.yaml",
+    )
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Thư mục chứa model (mặc định: thư mục mới nhất trong models/)",
+    )
+    return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# 2. Config
+# ---------------------------------------------------------------------------
+
+def load_config(path: Path) -> dict:
     """
-    Đọc X_test và model đã fit từ disk.
+    Đọc toàn bộ cấu hình từ config.yaml.
 
-    X_test.parquet đã chứa cột 'Date' (được gắn bởi validation.prepare_final_split).
-    Model artifacts là {target}.joblib được train.py xuất ra.
+    Parameters
+    ----------
+    path : Path
+        Đường dẫn tới config.yaml.
 
-    Returns:
-        X_test   (pd.DataFrame): Feature matrix test (có cột 'Date').
-        models   (dict[str, model]): Model đã fit theo target.
-
-    Raises:
-        FileNotFoundError: Nếu X_test hoặc bất kỳ model nào chưa tồn tại.
+    Returns
+    -------
+    dict
+        Dictionary chứa toàn bộ config.
     """
-    required = {'X_test': config.FEATURES / 'X_test.parquet'}
-    required.update({
-        f'model_{t}': config.MODELS / f'model_{t}.joblib'
-        for t in TARGETS
-    })
-
-    missing = [k for k, p in required.items() if not p.exists()]
-    if missing:
-        raise FileNotFoundError(
-            f"Chưa tìm thấy artifacts: {missing}.\n"
-            f"Thứ tự chạy đúng: --feat → (validation) → --train → --infer."
-        )
-
-    X_test = pd.read_parquet(required['X_test'])
-    X_test['Date'] = pd.to_datetime(X_test['Date'])
-
-    models = {
-        target: joblib.load(required[f'model_{target}'])
-        for target in TARGETS
-    }
-
-    logger.info(f"   X_test : {X_test.shape} | Date range: "
-                f"{X_test['Date'].min().date()} → {X_test['Date'].max().date()}")
-    for target, model in models.items():
-        logger.info(f"   model_{target} : {type(model).__name__} loaded ")
-
-    return X_test, models
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
-# ==========================================
-# BƯỚC 2: PREDICT
-# ==========================================
+# ---------------------------------------------------------------------------
+# 3. Model Loading
+# ---------------------------------------------------------------------------
 
-def _predict(
-    X_test  : pd.DataFrame,
-    models  : dict,
+def _find_latest_model_dir(base_model_dir: Path) -> Path:
+    """
+    Tìm thư mục model mới nhất (sắp xếp theo tên timestamp).
+
+    Parameters
+    ----------
+    base_model_dir : Path
+        Thư mục gốc chứa các thư mục model.
+
+    Returns
+    -------
+    Path
+        Thư mục model mới nhất.
+
+    Raises
+    ------
+    FileNotFoundError
+        Nếu không tìm thấy thư mục model nào.
+    """
+    subdirs = sorted(
+        [d for d in base_model_dir.iterdir() if d.is_dir()],
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    if not subdirs:
+        raise FileNotFoundError(f"Không tìm thấy thư mục model trong: {base_model_dir}")
+    latest = subdirs[0]
+    logger.info("Sử dụng model directory: %s", latest)
+    return latest
+
+
+def load_model(model_dir: Path) -> Tuple[Any, Any]:
+    """
+    Load model_revenue.pkl và model_margin.pkl từ thư mục model.
+
+    Parameters
+    ----------
+    model_dir : Path
+        Thư mục chứa hai file pkl.
+
+    Returns
+    -------
+    Tuple[Any, Any]
+        Cặp (model_revenue, model_margin).
+
+    Raises
+    ------
+    FileNotFoundError
+        Nếu thiếu một trong hai file model.
+    """
+    path_rev = model_dir / "model_revenue.pkl"
+    path_mar = model_dir / "model_margin.pkl"
+
+    for p in (path_rev, path_mar):
+        if not p.exists():
+            raise FileNotFoundError(f"Không tìm thấy model file: {p}")
+
+    with open(path_rev, "rb") as f:
+        model_revenue = pickle.load(f)
+    logger.info("Đã load model_revenue từ: %s", path_rev)
+
+    with open(path_mar, "rb") as f:
+        model_margin = pickle.load(f)
+    logger.info("Đã load model_margin từ: %s", path_mar)
+
+    return model_revenue, model_margin
+
+
+# ---------------------------------------------------------------------------
+# 4. Data Loading
+# ---------------------------------------------------------------------------
+
+def load_feature_table(processed_dir: Path) -> pd.DataFrame:
+    """
+    Load test_features.parquet từ thư mục processed.
+
+    Parameters
+    ----------
+    processed_dir : Path
+        Thư mục chứa test_features.parquet.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame đã sắp xếp theo date tăng dần.
+    """
+    path = processed_dir / "test_features.parquet"
+    df = pd.read_parquet(path)
+    df = df.sort_values("date").reset_index(drop=True)
+    logger.info("Đã load test_features: %d dòng", len(df))
+    return df
+
+
+def load_feature_cols(model_dir: Path) -> List[str]:
+    """
+    Load danh sách feature columns đã được lưu lúc train.
+
+    Đảm bảo inference dùng đúng thứ tự và tập cột mà model đã được fit.
+
+    Parameters
+    ----------
+    model_dir : Path
+        Thư mục model chứa feature_cols.json.
+
+    Returns
+    -------
+    List[str]
+        Danh sách tên cột feature theo thứ tự train.
+
+    Raises
+    ------
+    FileNotFoundError
+        Nếu không tìm thấy feature_cols.json.
+    """
+    import json
+    path = model_dir / "feature_cols.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Không tìm thấy feature_cols.json: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        feature_cols = json.load(f)
+    logger.info("Đã load feature_cols: %d cột", len(feature_cols))
+    return feature_cols
+
+
+def _predict_sklearn(model: Any, X: pd.DataFrame) -> pd.Series:
+    """
+    Dự báo bằng model sklearn-compatible.
+
+    Parameters
+    ----------
+    model : Any
+        Model đã fit (LightGBM / XGBoost / CatBoost).
+    X : pd.DataFrame
+        Feature matrix tập test.
+
+    Returns
+    -------
+    pd.Series
+        Series dự báo (reset index).
+    """
+    preds = model.predict(X)
+    return pd.Series(preds, index=X.index)
+
+
+def _predict_prophet(
+    model: Any,
+    df_test: pd.DataFrame,
+    feature_cols: list[str],
+) -> pd.Series:
+    """
+    Dự báo bằng Prophet.
+
+    Parameters
+    ----------
+    model : Any
+        Prophet model đã fit.
+    df_test : pd.DataFrame
+        Tập test với cột date và các cột regressor.
+    feature_cols : list[str]
+        Danh sách cột regressor đã được add_regressor.
+
+    Returns
+    -------
+    pd.Series
+        Series dự báo, index bằng với df_test.index.
+    """
+    future = df_test[["date"] + feature_cols].rename(columns={"date": "ds"})
+    forecast = model.predict(future)
+    return pd.Series(forecast["yhat"].values, index=df_test.index)
+
+
+def build_submission(
+    df: pd.DataFrame,
+    model_rev: Any,
+    model_mar: Any,
+    feature_cols: List[str],
+    date_col: str,
+    sample_sub_path: Path,
+    cfg: dict,
 ) -> pd.DataFrame:
     """
-    Chạy predict cho từng target, clip về miền hợp lệ [0, ∞).
+    Dự báo Revenue và Margin, tính COGS, sắp xếp theo sample_submission.
 
-    Revenue và COGS là đại lượng tài chính — không thể âm về nghiệp vụ.
-    clip(lower=0) là hard business constraint, áp dụng sau predict.
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Feature table đã lọc tập test.
+    model_rev : Any
+        Model dự báo Revenue.
+    model_mar : Any
+        Model dự báo Margin.
+    feature_cols : List[str]
+        Danh sách cột feature load từ feature_cols.json (đúng thứ tự train).
+    date_col : str
+        Tên cột date trong feature_table.
+    sample_sub_path : Path
+        Đường dẫn sample_submission.csv.
+    cfg : dict
+        Config đầy đủ.
 
-    Args:
-        X_test (pd.DataFrame): Feature matrix đã scale, có cột 'Date'.
-        models (dict[str, model]): Model đã fit.
-
-    Returns:
-        pd.DataFrame: Predictions với cột Date + từng target.
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame với 3 cột: Date, Revenue, COGS — theo thứ tự của sample_submission.
     """
-    date_col    = X_test[['Date']].reset_index(drop=True)
-    feature_cols = [c for c in X_test.columns if c != 'Date']
-    X           = X_test[feature_cols].values
+    model_name: str = cfg["models"]["active"]
 
-    preds = {'Date': date_col['Date']}
+    logger.info("Số feature dùng cho inference: %d", len(feature_cols))
 
-    for target in TARGETS:
-        if target not in models:
-            logger.warning(f"   [{target}] Không có model → skip.")
-            continue
+    # Predict
+    if model_name == "prophet":
+        rev_preds = _predict_prophet(model_rev, df, feature_cols)
+        mar_preds = _predict_prophet(model_mar, df, feature_cols)
+    else:
+        X_test = df[feature_cols]
+        rev_preds = _predict_sklearn(model_rev, X_test)
+        mar_preds = _predict_sklearn(model_mar, X_test)
 
-        raw_pred          = models[target].predict(X)
-        clipped_pred      = np.maximum(raw_pred, 0.0)   # hard constraint: không âm
-        n_clipped         = int((raw_pred < 0).sum())
+    # Tính COGS = Revenue × Margin
+    result = df[[date_col]].copy()
+    result["Revenue"] = rev_preds.values
+    result["margin_pred"] = mar_preds.values
+    result["COGS"] = result["Revenue"] * result["margin_pred"]
+    result = result.rename(columns={date_col: "Date"})
+    result["Date"] = pd.to_datetime(result["Date"])
 
-        if n_clipped > 0:
-            logger.warning(
-                f"   [{target}] {n_clipped} predictions âm → clip về 0 "
-                f"(min raw = {raw_pred.min():,.0f})."
-            )
-        else:
-            logger.info(f"   [{target}] Không có prediction âm ")
+    logger.info(
+        "Dự báo hoàn tất: Revenue mean=%.2f | COGS mean=%.2f",
+        result["Revenue"].mean(),
+        result["COGS"].mean(),
+    )
 
-        preds[target] = clipped_pred
-        logger.info(
-            f"   [{target}] mean={clipped_pred.mean():>12,.0f} | "
-            f"min={clipped_pred.min():>12,.0f} | "
-            f"max={clipped_pred.max():>12,.0f}"
+    # Load sample_submission để lấy thứ tự ngày chuẩn
+    sample_sub = pd.read_csv(sample_sub_path, parse_dates=["Date"])
+    logger.info("sample_submission: %d dòng", len(sample_sub))
+
+    # Merge theo thứ tự sample_submission — không sort lại
+    submission = sample_sub[["Date"]].merge(
+        result[["Date", "Revenue", "COGS"]],
+        on="Date",
+        how="left",
+    )
+
+    return submission[["Date", "Revenue", "COGS"]]
+
+
+# ---------------------------------------------------------------------------
+# 6. Save & Validate
+# ---------------------------------------------------------------------------
+
+def save_submission(submission: pd.DataFrame, output_dir: Path) -> None:
+    """
+    Validate và lưu submission.csv ra thư mục output.
+
+    Parameters
+    ----------
+    submission : pd.DataFrame
+        DataFrame kết quả với 3 cột: Date, Revenue, COGS.
+    output_dir : Path
+        Thư mục đầu ra.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / "submission.csv"
+    submission.to_csv(out_path, index=False)
+    logger.info("Đã lưu submission: %s (%d dòng)", out_path, len(submission))
+
+
+def _validate_submission(
+    submission: pd.DataFrame,
+    sample_sub_path: Path,
+) -> None:
+    """
+    Kiểm tra số dòng và giá trị null của submission so với sample_submission.
+
+    Parameters
+    ----------
+    submission : pd.DataFrame
+        DataFrame kết quả đã build.
+    sample_sub_path : Path
+        Đường dẫn sample_submission.csv.
+    """
+    sample_sub = pd.read_csv(sample_sub_path)
+    expected_rows = len(sample_sub)
+    actual_rows = len(submission)
+
+    if actual_rows != expected_rows:
+        logger.error(
+            "Số dòng KHÔNG khớp! Expected=%d, Actual=%d",
+            expected_rows,
+            actual_rows,
         )
+    else:
+        logger.info("Validate OK: %d dòng khớp với sample_submission", actual_rows)
 
-    return pd.DataFrame(preds)
+    # Kiểm tra null
+    null_counts = submission[["Revenue", "COGS"]].isnull().sum()
+    if null_counts.any():
+        logger.error("Phát hiện giá trị null trong submission:\n%s", null_counts[null_counts > 0])
+    else:
+        logger.info("Validate OK: không có giá trị null trong Revenue và COGS")
+
+    # Kiểm tra Revenue và COGS dương
+    n_neg_rev = (submission["Revenue"] < 0).sum()
+    n_neg_cogs = (submission["COGS"] < 0).sum()
+    if n_neg_rev > 0:
+        logger.warning("Phát hiện %d dòng Revenue âm", n_neg_rev)
+    if n_neg_cogs > 0:
+        logger.warning("Phát hiện %d dòng COGS âm", n_neg_cogs)
 
 
-# ==========================================
-# BƯỚC 3: SANITY CHECKS
-# ==========================================
+# ---------------------------------------------------------------------------
+# 7. Main
+# ---------------------------------------------------------------------------
 
-def _run_sanity_checks(predictions: pd.DataFrame) -> bool:
+def main() -> None:
     """
-    Kiểm tra tính hợp lệ của predictions trước khi xuất submission.
+    Điểm vào chính của inference.py.
 
-    5 checks theo thứ tự nghiêm trọng:
-        1. Không có NaN — crash nếu vi phạm (fatal).
-        2. Mọi giá trị >= 0 — crash nếu vi phạm (fatal, không nên xảy ra sau clip).
-        3. Số dòng khớp date spine test — crash nếu vi phạm (fatal).
-        4. Date range đúng TEST_START → TEST_END — crash nếu vi phạm (fatal).
-        5. Revenue >= COGS — warning nếu vi phạm (nghiệp vụ: gross margin > 0).
-
-    Args:
-        predictions (pd.DataFrame): DataFrame với cột Date + targets.
-
-    Returns:
-        bool: True nếu pass tất cả checks (kể cả có warning).
-
-    Raises:
-        ValueError: Nếu vi phạm check fatal (1–4).
+    Luồng:
+      1. Parse args, load config
+      2. Load model (thư mục mới nhất hoặc chỉ định qua --model-dir)
+      3. Load feature_table, lọc tập test bằng Date Masking
+      4. Build submission (predict revenue, margin, tính COGS)
+      5. Validate và save
     """
-    logger.info("   Chạy sanity checks...")
-    passed = True
+    args = parse_args()
+    cfg = load_config(args.config)
 
-    # Check 1: Không có NaN
-    nan_counts = predictions[TARGETS].isna().sum()
-    if nan_counts.any():
-        raise ValueError(
-            f"[FATAL] Predictions chứa NaN:\n{nan_counts[nan_counts > 0]}"
-        )
-    logger.info("   [1/5] No NaN ")
+    # Setup logging
+    log_dir = Path(cfg["paths"]["log_dir"])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"pipeline_{datetime.now():%Y%m%d_%H%M%S}_inference.log"
+    logging.basicConfig(
+        level=getattr(logging, cfg["logging"]["level"]),
+        format=cfg["logging"]["format"],
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
 
-    # Check 2: Không âm (sau clip không nên xảy ra, nhưng defense in depth)
-    neg_counts = (predictions[TARGETS] < 0).sum()
-    if neg_counts.any():
-        raise ValueError(
-            f"[FATAL] Predictions âm sau clip — unexpected:\n{neg_counts[neg_counts > 0]}"
-        )
-    logger.info("   [2/5] All >= 0 ")
+    processed_dir = Path(cfg["paths"]["processed_dir"])
+    base_model_dir = Path(cfg["paths"]["model_dir"])
+    output_dir = Path(cfg["paths"]["output_dir"])
+    raw_dir = Path(cfg["paths"]["raw_dir"])
+    sample_sub_path = raw_dir / "sample_submission.csv"
 
-    # Check 3: Số dòng
-    expected_start = pd.Timestamp(TEST_START)
-    expected_end   = pd.Timestamp(TEST_END)
-    expected_dates = pd.date_range(expected_start, expected_end, freq='D')
-    if len(predictions) != len(expected_dates):
-        raise ValueError(
-            f"[FATAL] Số dòng predictions ({len(predictions)}) "
-            f"!= expected date spine ({len(expected_dates)})."
-        )
-    logger.info(f"   [3/5] Row count = {len(predictions)} ")
+    date_col_cfg: str = cfg["data"]["date_col"]   # "Date" (raw)
+    test_start = pd.Timestamp(cfg["data"]["test_start"])
+    test_end = pd.Timestamp(cfg["data"]["test_end"])
 
-    # Check 4: Date range
-    actual_min = predictions['Date'].min()
-    actual_max = predictions['Date'].max()
-    if actual_min != expected_start or actual_max != expected_end:
-        raise ValueError(
-            f"[FATAL] Date range sai. "
-            f"Expected: {expected_start.date()} → {expected_end.date()} | "
-            f"Actual: {actual_min.date()} → {actual_max.date()}"
-        )
-    logger.info(f"   [4/5] Date range {TEST_START} → {TEST_END} ")
+    # Resolve model directory
+    if args.model_dir is not None:
+        model_dir = args.model_dir
+    else:
+        model_dir = _find_latest_model_dir(base_model_dir)
 
-    # Check 5: Revenue >= COGS (gross margin dương)
-    if 'Revenue' in predictions.columns and 'COGS' in predictions.columns:
-        margin_violations = (predictions['Revenue'] < predictions['COGS']).sum()
-        if margin_violations > 0:
-            pct = margin_violations / len(predictions) * 100
-            logger.warning(
-                f"   [5/5] ⚠️  {margin_violations} ngày ({pct:.1f}%) có Revenue < COGS "
-                f"(gross margin âm). Kiểm tra lại model hoặc clip strategy."
-            )
-            passed = False  # Warning, không crash
-        else:
-            logger.info("   [5/5] Revenue >= COGS mọi ngày ")
+    # Load model
+    model_revenue, model_margin = load_model(model_dir)
 
-    return passed
+    # Load feature_table
+    df = load_feature_table(processed_dir)
 
+    # Lọc tập test bằng Date Masking (không dùng iloc)
+    df["date"] = pd.to_datetime(df["date"])
+    df_test = df[
+        (df["date"] >= test_start) & (df["date"] <= test_end)
+    ].copy()
 
-# ==========================================
-# ASSEMBLE SUBMISSION
-# ==========================================
+    logger.info(
+        "Tập test: %d dòng (%s → %s)",
+        len(df_test),
+        df_test["date"].min().date() if len(df_test) > 0 else "N/A",
+        df_test["date"].max().date() if len(df_test) > 0 else "N/A",
+    )
 
-def _assemble_submission(predictions: pd.DataFrame) -> pd.DataFrame:
-    """
-    Format predictions thành submission.csv theo đúng yêu cầu đề bài.
+    if len(df_test) == 0:
+        logger.error("Tập test rỗng — kiểm tra lại test_start và test_end trong config")
+        return
 
-    Yêu cầu từ đề bài (Đề_bài_phần_3.txt):
-        - Cột: Date, Revenue, COGS.
-        - Giữ đúng thứ tự dòng (chronological, không shuffle).
-        - Revenue và COGS là số thực (float), không làm tròn tại đây
-          để tránh mất precision — BTC tự làm tròn nếu cần.
+    # Load feature_cols đúng thứ tự từ lúc train
+    feature_cols = load_feature_cols(model_dir)
 
-    Args:
-        predictions (pd.DataFrame): Kết quả từ _predict(), có cột Date + targets.
+    # Build submission
+    submission = build_submission(
+        df=df_test,
+        model_rev=model_revenue,
+        model_mar=model_margin,
+        feature_cols=feature_cols,
+        date_col="date",
+        sample_sub_path=sample_sub_path,
+        cfg=cfg,
+    )
 
-    Returns:
-        pd.DataFrame: submission DataFrame đúng format.
-    """
-    submission = predictions[['Date'] + TARGETS].copy()
-    submission = submission.sort_values('Date').reset_index(drop=True)
-    submission['Date'] = submission['Date'].dt.strftime('%Y-%m-%d')
-    return submission
+    # Validate
+    _validate_submission(submission, sample_sub_path)
+
+    # Save
+    save_submission(submission, output_dir)
+
+    logger.info("Inference hoàn tất. Submission: %s", output_dir / "submission.csv")
 
 
-def _build_diagnostics(
-    predictions : pd.DataFrame,
-    X_test      : pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Tạo bảng diagnostics để kiểm tra sanity trước khi nộp bài.
-
-    Bổ sung thêm vào predictions:
-        - gross_margin_pct : (Revenue - COGS) / Revenue × 100 — check lợi nhuận gộp.
-        - cogs_ratio       : COGS / Revenue — check cấu trúc chi phí.
-        - month            : Tháng — tiện lọc seasonal patterns.
-        - year             : Năm.
-
-    Không dùng để nộp bài — chỉ để bro verify bằng mắt trước khi submit.
-
-    Args:
-        predictions (pd.DataFrame): DataFrame predictions gốc (Date kiểu Timestamp).
-        X_test      (pd.DataFrame): X_test (có cột 'Date').
-
-    Returns:
-        pd.DataFrame: Bảng diagnostics.
-    """
-    diag = predictions.copy()
-    diag['Date'] = pd.to_datetime(diag['Date'])
-
-    if 'Revenue' in diag.columns and 'COGS' in diag.columns:
-        diag['gross_margin_pct'] = (
-            (diag['Revenue'] - diag['COGS']) / diag['Revenue'].clip(lower=1) * 100
-        ).round(2)
-        diag['cogs_ratio'] = (
-            diag['COGS'] / diag['Revenue'].clip(lower=1)
-        ).round(4)
-
-    diag['month'] = diag['Date'].dt.month
-    diag['year']  = diag['Date'].dt.year
-
-    return diag
-
-
-# ==========================================
-# ORCHESTRATOR
-# ==========================================
-
-def run_inference(force_rerun: bool = False) -> pd.DataFrame:
-    """
-    Entry point chính — thực thi toàn bộ Inference Pipeline.
-
-    - force_rerun=False (default): Bỏ qua nếu submission.csv đã tồn tại.
-    - force_rerun=True            : Chạy lại dù submission đã có.
-
-    Thứ tự:
-        1. Kiểm tra artifact đã tồn tại chưa.
-        2. Load X_test + models.
-        3. Predict + clip.
-        4. Sanity checks.
-        5. Assemble submission + diagnostics.
-        6. Lưu submission.csv + submission_diag.csv.
-
-    Args:
-        force_rerun (bool): Mặc định False để tránh overwrite vô ý.
-
-    Returns:
-        pd.DataFrame: submission DataFrame (Date, Revenue, COGS).
-
-    Raises:
-        FileNotFoundError: Artifacts chưa tồn tại.
-        ValueError       : Sanity check fatal thất bại.
-    """
-    logger.info("=" * 60)
-    logger.info("BẮT ĐẦU INFERENCE PIPELINE")
-    logger.info("=" * 60)
-
-    submission_path = config.SUBMISSIONS / 'submission.csv'
-    config.SUBMISSIONS.mkdir(parents=True, exist_ok=True)
-
-    if not force_rerun and submission_path.exists():
-        logger.info(
-            "submission.csv đã tồn tại. Bỏ qua để tránh overwrite "
-            "(đặt force_rerun=True để chạy lại)."
-        )
-        return pd.read_csv(submission_path)
-
-    # ── Bước 1: Load ──────────────────────────────────────────────────────────
-    logger.info("\nBước 1 — Load artifacts...")
-    X_test, models = _load_inference_artifacts()
-
-    # ── Bước 2: Predict ───────────────────────────────────────────────────────
-    logger.info("\nBước 2 — Predict...")
-    predictions = _predict(X_test, models)
-
-    # ── Bước 3: Sanity checks ─────────────────────────────────────────────────
-    logger.info("\nBước 3 — Sanity checks...")
-    _run_sanity_checks(predictions)
-
-    # ── Bước 4: Assemble + Export ─────────────────────────────────────────────
-    logger.info("\nBước 4 — Assemble và xuất submission...")
-    submission = _assemble_submission(predictions)
-    submission.to_csv(submission_path, index=False)
-    logger.info(f"   Đã lưu: {submission_path}")
-
-    diag = _build_diagnostics(predictions, X_test)
-    diag_path = config.SUBMISSIONS / 'submission_diag.csv'
-    diag.to_csv(diag_path, index=False)
-    logger.info(f"   Đã lưu: {diag_path}")
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    logger.info("\n" + "=" * 60)
-    logger.info("INFERENCE PIPELINE HOÀN TẤT ")
-    logger.info(f"  Rows     : {len(submission)}")
-    logger.info(f"  Columns  : {list(submission.columns)}")
-    for target in TARGETS:
-        col = submission[target]
-        logger.info(
-            f"  {target:<10}: mean={col.mean():>12,.0f} | "
-            f"min={col.min():>12,.0f} | max={col.max():>12,.0f}"
-        )
-    if 'gross_margin_pct' in diag.columns:
-        logger.info(
-            f"  GrossMargin: mean={diag['gross_margin_pct'].mean():.1f}% | "
-            f"min={diag['gross_margin_pct'].min():.1f}% | "
-            f"max={diag['gross_margin_pct'].max():.1f}%"
-        )
-    logger.info(f"  Output   : {config.SUBMISSIONS}")
-    logger.info("=" * 60)
-
-    return submission
+if __name__ == "__main__":
+    main()

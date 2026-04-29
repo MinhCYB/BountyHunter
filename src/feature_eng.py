@@ -1,553 +1,877 @@
 """
-================================================================================
-MODULE: FEATURE ENGINEERING PIPELINE
-================================================================================
+src/feature_eng.py — Agent 2: Feature Engineering.
 
-Mục đích:
-    Biến đổi master_table.parquet thành feature matrix X_full và target vector
-    y_full theo toàn bộ date spine. Module này KHÔNG split, KHÔNG scale,
-    KHÔNG impute — toàn bộ trách nhiệm đó thuộc về validation.py.
+Pipeline: Load base_table (4,381 ngày) → Build Nhóm A (Calendar/Holiday/Fourier,
+không shift) → Build Promotion Intensity (dùng promotions đã được mở rộng sang
+2023–2024 bằng chu kỳ 2 năm) → Drop observed daily cols → Split → Ghi
+train_features.parquet + test_features.parquet.
 
-Chiến lược: Safe Lag Only (không recursive forecast)
-    Câu hỏi kiểm tra với mỗi feature:
-        "Ngày 2024-06-30, feature này có tính được từ thông tin đã biết không?"
+THAY ĐỔI SO VỚI PHIÊN BẢN CŨ:
+  [FIX 1] load_promotions(): mở rộng chu kỳ khuyến mãi 2021→2023, 2022→2024
+          bằng pd.DateOffset(years=2) — đảm bảo tập Test có promo signal.
+  [FIX 2] Nhóm B (build_lag_features, build_macd_features,
+          build_price_discount_elasticity, build_web_traffic_features,
+          build_inventory_features) bị VÔ HIỆU HÓA hoàn toàn vì gây Data
+          Leakage và NaN toàn bộ khi Horizon > 1 ngày.
+          split_and_save() drop thêm OBSERVED_COLS (daily aggregates từ
+          data_prep) trước khi ghi file, triệt tiêu mọi rò rỉ.
 
-    4 nhóm feature:
-        Nhóm 1 — Calendar Features  : Chỉ cần date, an toàn tuyệt đối.
-        Nhóm 2 — YoY Lag Features   : Lag >= 364 ngày + rolling volatility.
-        Nhóm 3 — Seasonal Stats     : Fit trên train_mask, map theo calendar key.
-        Nhóm 4 — Promo Calendar     : Extrapolate pattern từ promotions.csv.
-
-    Tại sao lag_728 thay vì lag_365:
-        Test kết thúc 2024-07-01.
-        lag_365(2024-07-01) = 2023-07-01 → ngoài train → NaN toàn bộ H2/2024.
-        lag_728(2024-07-01) = 2022-07-01 → trong train ✅
-
-    Tại sao có thêm rolling volatility (Nhóm 2):
-        Model không chỉ cần biết "cùng kỳ năm ngoái revenue bao nhiêu" mà còn
-        cần biết "cùng kỳ năm ngoái có ổn định không". std cao = giai đoạn bất
-        ổn (COVID-like), model nên conservative hơn khi dùng lag đó làm anchor.
-        signal_quality = 1/(1+CV) tổng hợp thành 1 con số [0,1] đo độ tin cậy.
-
-    Tại sao Nhóm 4 hợp lệ (không phải external data):
-        promotions.csv cho thấy pattern lặp lại đều đặn mỗi năm:
-          Spring Sale (tháng 3), Mid-Year Sale (tháng 6), Fall Launch (tháng 8),
-          Year-End Sale (tháng 11), Urban Blowout & Rural Special (năm lẻ).
-        Extrapolate sang 2023-2024 là suy luận từ internal data.
-
-    Tại sao KHÔNG có regime flags:
-        One-hot flag "ecom_boom / covid_period" chỉ xuất hiện 1 lần trong lịch sử.
-        Tree model không thể học từ 1 lần xuất hiện → feature vô nghĩa thống kê.
-        Thay vào đó: yoy_growth và rolling volatility đã encode "triệu chứng" của
-        từng regime mà không cần đặt nhãn.
-
-Đầu ra — data/features/:
-    calendar_features.parquet       — Nhóm 1
-    yoy_features.parquet            — Nhóm 2 (lag + volatility)
-    seasonal_stats.parquet          — Nhóm 3
-    promo_calendar_features.parquet — Nhóm 4
-    X_full.parquet                  — Feature matrix toàn date spine (chưa split/scale)
-    y_full.parquet                  — Target vector toàn date spine
-    feature_metadata.parquet        — Tên, nhóm, null_pct_raw của từng feature
+Tuân thủ PART_II: không print, không for-loop trên DF, không hardcode tham số,
+type hint + docstring đầy đủ, không downcast target.
 """
 
-import pandas as pd
+import argparse
+import logging
+from pathlib import Path
+from typing import List, Tuple
+
 import numpy as np
-import warnings
-warnings.filterwarnings('ignore')
+import pandas as pd
+import yaml
 
-from src.config import config
+logger = logging.getLogger(__name__)
 
-logger = config.get_logger(__name__)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-# ── Constants (từ config) ──────────────────────────────────────────────────────
-TRAIN_START     = config.TRAIN_START
-TRAIN_END       = config.TRAIN_END
-TEST_START      = config.TEST_START
-TEST_END        = config.TEST_END
-TARGETS         = config.TARGETS
-SAFE_LAG_DAYS   = config.SAFE_LAG_DAYS
-ROLLING_WINDOWS = config.ROLLING_WINDOWS
+TARGET_COLS: List[str] = ["revenue", "cogs", "margin"]
+
+# Các cột sinh ra từ daily aggregates của data_prep (Agent 1).
+# Đây là dữ liệu QUAN SÁT THEO NGÀY — không tồn tại ở tập Test thực tế.
+# Phải drop trước khi split để triệt tiêu 100% leakage.
+OBSERVED_COLS: List[str] = [
+    "gross_revenue",
+    "total_discount",
+    "n_orders",
+    "n_items_sold",
+    "avg_order_value",
+    "sessions",
+    "page_views",
+    "unique_visitors",
+    "bounce_rate",
+    "avg_fill_rate",
+    "avg_stockout_days",
+    "pct_stockout_skus",
+    "avg_sell_through",
+    "unit_price",
+    "quantity",
+    "discount_amount",
+]
+
+# Ngày mùng 1 Tết Nguyên Đán (Dương lịch) hardcode cho 2012–2024.
+TET_NEW_YEAR_DATES: List[str] = [
+    "2012-01-23",  # Nhâm Thìn
+    "2013-02-10",  # Quý Tỵ
+    "2014-01-31",  # Giáp Ngọ
+    "2015-02-19",  # Ất Mùi
+    "2016-02-08",  # Bính Thân
+    "2017-01-28",  # Đinh Dậu
+    "2018-02-16",  # Mậu Tuất
+    "2019-02-05",  # Kỷ Hợi
+    "2020-01-25",  # Canh Tý
+    "2021-02-12",  # Tân Sửu
+    "2022-02-01",  # Nhâm Dần
+    "2023-01-22",  # Quý Mão
+    "2024-02-10",  # Giáp Thìn
+]
+
+# Prefix nhận diện Nhóm A — dùng trong validate
+GROUP_A_PREFIXES: Tuple[str, ...] = (
+    "day_", "week_", "month", "quarter", "year",
+    "is_", "days_to_", "days_from_", "sin_", "cos_",
+    "n_active_promos", "max_discount_pct", "has_stackable_promo", "pis_score",
+)
 
 
-# ==========================================
-# NHÓM 1: CALENDAR FEATURES
-# ==========================================
+# ---------------------------------------------------------------------------
+# Parse arguments & Config
+# ---------------------------------------------------------------------------
 
-def build_calendar_features(dates: pd.Series) -> pd.DataFrame:
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments cho feature_eng.py."""
+    parser = argparse.ArgumentParser(
+        description="Feature Engineering — tạo train_features.parquet + test_features.parquet"
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config.yaml"),
+        help="Đường dẫn tới file config.yaml",
+    )
+    return parser.parse_args()
+
+
+def load_config(path: Path) -> dict:
     """
-    Temporal features thuần từ date — an toàn tuyệt đối với mọi horizon.
+    Đọc toàn bộ cấu hình từ config.yaml.
 
-    Features:
-        Basic      : year, quarter, month, week_of_year, day_of_month,
-                     day_of_week (0=Mon), day_of_year
-        Flags      : is_weekend, is_month_start/end, is_quarter_start/end,
-                     is_year_start/end
-        Cyclical   : sin/cos của month, day_of_week, week_of_year, day_of_year
-                     — tránh model coi tháng 12→1 là "xa nhau"
-        Trend      : years_since_start — capture organic business growth
+    Parameters
+    ----------
+    path : Path
+        Đường dẫn tới config.yaml.
 
-    Args:
-        dates (pd.Series): Series kiểu datetime.
-
-    Returns:
-        pd.DataFrame: Calendar features với cột 'Date'.
+    Returns
+    -------
+    dict
+        Cấu hình pipeline.
     """
-    df = pd.DataFrame({'Date': dates})
-    dt = df['Date'].dt
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
-    df['year']         = dt.year
-    df['quarter']      = dt.quarter
-    df['month']        = dt.month
-    df['week_of_year'] = dt.isocalendar().week.astype(int)
-    df['day_of_month'] = dt.day
-    df['day_of_week']  = dt.dayofweek
-    df['day_of_year']  = dt.dayofyear
 
-    df['is_weekend']       = (dt.dayofweek >= 5).astype(int)
-    df['is_month_start']   = dt.is_month_start.astype(int)
-    df['is_month_end']     = dt.is_month_end.astype(int)
-    df['is_quarter_start'] = dt.is_quarter_start.astype(int)
-    df['is_quarter_end']   = dt.is_quarter_end.astype(int)
-    df['is_year_start']    = dt.is_year_start.astype(int)
-    df['is_year_end']      = dt.is_year_end.astype(int)
+def setup_logging(config: dict) -> None:
+    """
+    Cấu hình logging toàn bộ pipeline từ config.
 
-    df['month_sin'] = np.sin(2 * np.pi * dt.month / 12)
-    df['month_cos'] = np.cos(2 * np.pi * dt.month / 12)
-    df['dow_sin']   = np.sin(2 * np.pi * dt.dayofweek / 7)
-    df['dow_cos']   = np.cos(2 * np.pi * dt.dayofweek / 7)
-    df['week_sin']  = np.sin(2 * np.pi * dt.isocalendar().week.astype(int) / 52)
-    df['week_cos']  = np.cos(2 * np.pi * dt.isocalendar().week.astype(int) / 52)
-    df['doy_sin']   = np.sin(2 * np.pi * dt.dayofyear / 365)
-    df['doy_cos']   = np.cos(2 * np.pi * dt.dayofyear / 365)
+    Parameters
+    ----------
+    config : dict
+        Cấu hình đọc từ config.yaml.
+    """
+    log_dir = Path(config["paths"]["log_dir"])
+    log_dir.mkdir(parents=True, exist_ok=True)
 
-    base_year = pd.Timestamp(TRAIN_START).year
-    df['years_since_start'] = (dt.year - base_year) + (dt.dayofyear - 1) / 365.0
+    from datetime import datetime
+    log_file = log_dir / f"pipeline_{datetime.now():%Y%m%d_%H%M%S}.log"
 
-    logger.info(f"   [Nhóm 1] Calendar: {df.shape[1] - 1} features")
+    logging.basicConfig(
+        level=getattr(logging, config["logging"]["level"]),
+        format=config["logging"]["format"],
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Quy Tắc 7: Downcast — ngoại trừ target
+# ---------------------------------------------------------------------------
+
+def downcast_df(df: pd.DataFrame, exclude_cols: List[str]) -> pd.DataFrame:
+    """
+    Downcast dtype để tiết kiệm RAM. Bỏ qua các cột trong exclude_cols.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame cần downcast.
+    exclude_cols : List[str]
+        Cột KHÔNG được downcast (target + date).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame sau khi downcast.
+    """
+    for col in df.columns:
+        if col in exclude_cols:
+            continue
+        if df[col].dtype == "float64":
+            df[col] = pd.to_numeric(df[col], downcast="float")
+        elif df[col].dtype == "int64":
+            df[col] = pd.to_numeric(df[col], downcast="integer")
     return df
 
 
-# ==========================================
-# NHÓM 2: YOY LAG + ROLLING VOLATILITY
-# ==========================================
+# ---------------------------------------------------------------------------
+# Load
+# ---------------------------------------------------------------------------
 
-def build_yoy_features(master: pd.DataFrame) -> pd.DataFrame:
+def load_base_table(processed_dir: Path) -> pd.DataFrame:
     """
-    YoY lag, rolling mean, rolling volatility và signal quality features.
+    Đọc base_table.parquet (output của Agent 1).
+    Kỳ vọng 4,381 dòng: 3,833 dòng train (có dữ liệu) + 548 dòng test (NaN).
 
-    An toàn với horizon 18 tháng:
-        lag_728 an toàn tuyệt đối cho toàn bộ test period.
-        lag_364/365/366 bị NaN ở H2/2024 → được impute bằng lag_728 × (1 + yoy_growth).
-        Imputation này dùng thông tin đã biết nên an toàn, không phải train-fit imputation.
+    Parameters
+    ----------
+    processed_dir : Path
+        Thư mục chứa file parquet đã xử lý.
 
-    Các cột được lag (12 signals):
-        Revenue, COGS                           — targets chính
-        daily_gross_revenue, daily_net_revenue  — transaction volume proxy
-        daily_orders, daily_items_sold          — demand signals
-        daily_returns, daily_refund_amount      — quality/churn signals
-        total_sessions, total_page_views        — traffic leading indicators
-        avg_daily_rating                        — customer sentiment
-        daily_actual_discount                   — promotional pressure
-
-    Với mỗi signal, các features được tạo:
-        {alias}_lag{N}             : Raw lag tại N ngày trước (N trong SAFE_LAG_DAYS)
-        {alias}_roll{W}_lag364     : Rolling mean W ngày, anchor tại lag_364
-        {alias}_yoy_growth         : (lag_364 - lag_728) / lag_728, clip [-2, 10]
-        {alias}_trend_slope        : (roll30 - roll90) / roll90, clip [-5, 5]
-
-    Chỉ với Revenue và COGS (thêm volatility):
-        rev/cogs_vol{W}_lag364     : Rolling std W ngày quanh cùng kỳ năm ngoái
-        rev/cogs_cv{W}_lag364      : Coefficient of variation = std/mean, clip [0,10]
-        rev/cogs_signal_quality{W} : 1/(1+CV) — 1.0=ổn định, ~0=bất ổn
-
-        Ý nghĩa: COVID làm std cao → signal_quality thấp → model tự biết
-        "thông tin cùng kỳ năm ngoái kém tin cậy, đừng tin quá nhiều vào lag_728".
-
-    Args:
-        master (pd.DataFrame): Master table đầy đủ.
-
-    Returns:
-        pd.DataFrame: YoY features với cột 'Date'.
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame đã sắp xếp theo date tăng dần.
     """
-    df = master.copy().sort_values('Date').reset_index(drop=True)
+    path = processed_dir / "base_table.parquet"
+    df = pd.read_parquet(path)
+    df = df.sort_values("date").reset_index(drop=True)
+    n_nan_rev = int(df["revenue"].isna().sum()) if "revenue" in df.columns else -1
+    logger.info(
+        "Đã load base_table.parquet: %d dòng × %d cột | revenue NaN: %d",
+        df.shape[0], df.shape[1], n_nan_rev,
+    )
+    return df
 
-    lag_targets = {
-        'Revenue'             : 'rev',
-        'COGS'                : 'cogs',
-        'daily_gross_revenue' : 'gross_rev',
-        'daily_net_revenue'   : 'net_rev',
-        'daily_orders'        : 'orders',
-        'daily_items_sold'    : 'items',
-        'daily_returns'       : 'returns',
-        'daily_refund_amount' : 'refund',
-        'total_sessions'      : 'sessions',
-        'total_page_views'    : 'pageviews',
-        'avg_daily_rating'    : 'rating',
-        'daily_actual_discount': 'discount',
-    }
-    volatility_aliases = {'rev', 'cogs'}
 
-    result = df[['Date']].copy()
+def load_promotions(raw_dir: Path) -> pd.DataFrame:
+    """
+    Đọc, chuẩn hóa và mở rộng chu kỳ promotions.csv sang giai đoạn dự báo.
 
-    for col, alias in lag_targets.items():
-        if col not in df.columns:
-            logger.warning(f"   '{col}' không có trong master_table, bỏ qua.")
+    Promotions.csv chỉ chứa dữ liệu đến hết 2022. Hàm này lọc riêng các
+    sự kiện năm 2021 và 2022, tịnh tiến thời gian lên 2 năm bằng
+    pd.DateOffset(years=2) (2021→2023, 2022→2024), cập nhật tên event
+    tương ứng, rồi concat vào bảng gốc. Nhờ đó build_promotion_intensity()
+    sẽ có promo signal đầy đủ cho toàn bộ tập Test (2023–2024).
+
+    Quy luật chu kỳ được giữ nguyên:
+      - Rural Special: năm lẻ (2021 → 2023)
+      - Urban Blowout: năm chẵn (2022 → 2024)
+      - Sale tháng 3, 6, 8, 11: lặp lại mỗi năm
+
+    Parameters
+    ----------
+    raw_dir : Path
+        Thư mục chứa file CSV thô.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame promotions với start_date, end_date là datetime64.
+        Đã bổ sung các dòng tương ứng năm 2023 và 2024.
+        applicable_category giữ NaN (NULLABLE_BY_DESIGN).
+    """
+    df = pd.read_csv(
+        raw_dir / "promotions.csv",
+        parse_dates=["start_date", "end_date"],
+    )
+    df.columns = [c.lower() for c in df.columns]
+    df["promo_type"]     = df["promo_type"].astype("category")
+    df["stackable_flag"] = pd.to_numeric(df["stackable_flag"], downcast="integer")
+    df["discount_value"] = pd.to_numeric(df["discount_value"], downcast="float")
+    # applicable_category là NULLABLE_BY_DESIGN — không impute
+    if "applicable_category" in df.columns:
+        df["applicable_category"] = df["applicable_category"].astype("category")
+
+    logger.info("Đã load promotions.csv gốc: %d dòng", len(df))
+
+    # --- Mở rộng chu kỳ: 2021 → 2023, 2022 → 2024 ---
+    offset = pd.DateOffset(years=2)
+
+    # Lọc riêng từng năm nguồn
+    mask_2021 = df["start_date"].dt.year == 2021
+    mask_2022 = df["start_date"].dt.year == 2022
+
+    extended_parts: List[pd.DataFrame] = []
+
+    for mask in (mask_2021, mask_2022):
+        if not mask.any():
             continue
 
-        series        = df[col]
-        series_lag364 = series.shift(364)
+        chunk = df[mask].copy()
 
-        # Raw lags
-        for lag in SAFE_LAG_DAYS:
-            result[f'{alias}_lag{lag}'] = series.shift(lag)
+        # Tịnh tiến start_date và end_date lên 2 năm — vectorized
+        chunk["start_date"] = chunk["start_date"] + offset
+        chunk["end_date"]   = chunk["end_date"]   + offset
 
-        # Rolling mean trên cùng kỳ năm ngoái
-        for w in ROLLING_WINDOWS:
-            result[f'{alias}_roll{w}_lag364'] = (
-                series_lag364
-                .rolling(w, min_periods=max(1, w // 2))
-                .mean()
+        # Cập nhật tên event: thay thế chuỗi năm nguồn bằng năm đích
+        # (VD: "Rural Special 2021" → "Rural Special 2023")
+        src_year  = str(chunk["start_date"].dt.year.iloc[0] - 2)  # năm nguồn
+        dest_year = str(chunk["start_date"].dt.year.iloc[0])       # năm đích
+        if "event_name" in chunk.columns:
+            chunk["event_name"] = chunk["event_name"].str.replace(
+                src_year, dest_year, regex=False
             )
 
-        # YoY growth rate
-        lag364 = series.shift(364)
-        lag728 = series.shift(728)
-        result[f'{alias}_yoy_growth'] = (
-            (lag364 - lag728) / lag728.replace(0, np.nan)
-        ).clip(-2, 10)
+        extended_parts.append(chunk)
 
-        # Trend slope: momentum ngắn hạn so với dài hạn của cùng kỳ
-        roll30 = series_lag364.rolling(30, min_periods=10).mean()
-        roll90 = series_lag364.rolling(90, min_periods=30).mean()
-        result[f'{alias}_trend_slope'] = (
-            (roll30 - roll90) / roll90.replace(0, np.nan)
-        ).clip(-5, 5)
+    if extended_parts:
+        df_extended = pd.concat([df] + extended_parts, ignore_index=True)
+        df_extended = df_extended.sort_values("start_date").reset_index(drop=True)
+        logger.info(
+            "Promotions sau khi mở rộng chu kỳ: %d dòng (thêm %d dòng cho 2023–2024)",
+            len(df_extended), len(df_extended) - len(df),
+        )
+        return df_extended
 
-        # Rolling volatility — chỉ cho Revenue và COGS
-        if alias in volatility_aliases:
-            for w in (30, 90):
-                vol  = series_lag364.rolling(w, min_periods=w // 2).std()
-                mean = series_lag364.rolling(w, min_periods=w // 2).mean().replace(0, np.nan)
-                cv   = (vol / mean.abs()).clip(0, 10)
-
-                result[f'{alias}_vol{w}_lag364']    = vol
-                result[f'{alias}_cv{w}_lag364']     = cv
-                result[f'{alias}_signal_quality{w}'] = 1.0 / (1.0 + cv)
-
-    # Impute lag_365/366 NaN ở H2/2024 bằng lag_728 × (1 + yoy_growth)
-    # An toàn: chỉ dùng thông tin đã biết, không phải train-fit imputation
-    for col, alias in [('Revenue', 'rev'), ('COGS', 'cogs')]:
-        for lag in [365, 366]:
-            lag_col = f'{alias}_lag{lag}'
-            if lag_col not in result.columns:
-                continue
-            mask = result[lag_col].isna()
-            if mask.sum() == 0:
-                continue
-            growth = result[f'{alias}_yoy_growth'].fillna(0)
-            result.loc[mask, lag_col] = (
-                result.loc[mask, f'{alias}_lag728'] * (1 + growth[mask])
-            )
-            logger.info(f"   Imputed {mask.sum()} NaN trong {lag_col} bằng lag728×(1+yoy_growth)")
-
-    logger.info(f"   [Nhóm 2] YoY Lag + Volatility: {result.shape[1] - 1} features")
-    return result
+    logger.warning(
+        "Không tìm thấy promo năm 2021 hoặc 2022 — trả về bảng gốc không mở rộng"
+    )
+    return df
 
 
-# ==========================================
-# NHÓM 3: SEASONAL STATS
-# ==========================================
+# ---------------------------------------------------------------------------
+# Nhóm A — Date-based Features (KHÔNG shift)
+# ---------------------------------------------------------------------------
 
-def build_seasonal_stats(master: pd.DataFrame, train_mask: pd.Series) -> pd.DataFrame:
+def build_calendar_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """
-    Thống kê mùa vụ lịch sử — fit ONLY trên train_mask, map theo calendar key.
+    [Nhóm A] Thêm calendar features từ cột date.
+    Tính trên TOÀN BỘ 4,381 ngày — không có NaN, không shift.
 
-    train_mask được truyền từ ngoài để hàm này tái sử dụng được trong cả:
-        - run_feature_engineering() : dùng full train mask (2012→2022)
-        - walk_forward_cv()         : dùng train mask của từng fold
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame đã có cột date (datetime64), sorted by date.
+    cfg : dict
+        Cấu hình pipeline.
 
-    Aggregation keys:
-        month, quarter, day_of_week, week_of_year, (month × day_of_week)
-
-    Statistics per key (Revenue và COGS):
-        mean, median, std, q25, q75, seasonal_idx
-        seasonal_idx = group_mean / annual_mean — 1.0 là trung bình năm
-
-    Args:
-        master (pd.DataFrame): Master table đầy đủ.
-        train_mask (pd.Series): Boolean mask chỉ train partition.
-
-    Returns:
-        pd.DataFrame: Seasonal stats features với cột 'Date'.
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame với các cột calendar được thêm vào.
     """
-    df       = master.copy().sort_values('Date').reset_index(drop=True)
-    train_df = df[train_mask].copy()
+    if not cfg["features"]["base_time_features"]["enabled"]:
+        logger.info("base_time_features: DISABLED — bỏ qua")
+        return df
 
-    for key in ['month', 'quarter', 'day_of_week', 'week_of_year']:
-        train_df[key] = getattr(train_df['Date'].dt, key if key != 'week_of_year' else 'isocalendar')
-    train_df['month']        = train_df['Date'].dt.month
-    train_df['quarter']      = train_df['Date'].dt.quarter
-    train_df['day_of_week']  = train_df['Date'].dt.dayofweek
-    train_df['week_of_year'] = train_df['Date'].dt.isocalendar().week.astype(int)
+    cols_before = df.shape[1]
+    dt = df["date"].dt
 
-    result = df[['Date']].copy()
-    result['month']        = df['Date'].dt.month
-    result['quarter']      = df['Date'].dt.quarter
-    result['day_of_week']  = df['Date'].dt.dayofweek
-    result['week_of_year'] = df['Date'].dt.isocalendar().week.astype(int)
+    df["day_of_week"]      = dt.dayofweek.astype("int8")
+    df["day_of_month"]     = dt.day.astype("int8")
+    df["week_of_year"]     = dt.isocalendar().week.astype("int8")
+    df["month"]            = dt.month.astype("int8")
+    df["quarter"]          = dt.quarter.astype("int8")
+    df["year"]             = dt.year.astype("int16")
+    df["is_weekend"]       = (dt.dayofweek >= 5).astype("int8")
+    df["is_month_start"]   = dt.is_month_start.astype("int8")
+    df["is_month_end"]     = dt.is_month_end.astype("int8")
+    df["is_quarter_start"] = dt.is_quarter_start.astype("int8")
+    df["is_quarter_end"]   = dt.is_quarter_end.astype("int8")
 
-    annual_means = {
-        t: train_df[t].mean() if t in train_df.columns else None
-        for t in TARGETS
-    }
+    cols_added = df.shape[1] - cols_before
+    logger.info("[Nhóm A] build_calendar_features: +%d cột", cols_added)
+    return df
 
-    def _add_stats(keys, prefix):
-        keys = [keys] if isinstance(keys, str) else list(keys)
-        for target, tname in zip(TARGETS, ['rev', 'cogs']):
-            if target not in train_df.columns:
-                continue
-            stats = (
-                train_df.groupby(keys, observed=True)[target]
-                .agg(
-                    _mean  ='mean',
-                    _median='median',
-                    _std   ='std',
-                    _q25   =lambda x: x.quantile(0.25),
-                    _q75   =lambda x: x.quantile(0.75),
-                )
-                .reset_index()
-            )
-            stats['_std'] = stats['_std'].fillna(0)
-            ann = annual_means[target]
-            stats['_sidx'] = stats['_mean'] / ann if ann and ann > 0 else 1.0
-            stats = stats.rename(columns={
-                '_mean'  : f'{prefix}_{tname}_mean',
-                '_median': f'{prefix}_{tname}_median',
-                '_std'   : f'{prefix}_{tname}_std',
-                '_q25'   : f'{prefix}_{tname}_q25',
-                '_q75'   : f'{prefix}_{tname}_q75',
-                '_sidx'  : f'{prefix}_{tname}_seasonal_idx',
-            })
-            new_cols = [c for c in stats.columns if c not in keys]
-            merged   = result[keys].merge(stats, on=keys, how='left')
-            for c in new_cols:
-                result[c] = merged[c].values
 
-    _add_stats('month',                  'by_month')
-    _add_stats('quarter',                'by_quarter')
-    _add_stats('day_of_week',            'by_dow')
-    _add_stats('week_of_year',           'by_week')
-    _add_stats(['month', 'day_of_week'], 'by_month_dow')
+def build_vn_holidays(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    [Nhóm A] Thêm các feature ngày lễ Việt Nam.
+    Tính trên TOÀN BỘ 4,381 ngày — không có NaN, không shift.
+    Gồm: is_tet (±7 ngày), is_30_4, is_1_5, is_2_9, is_christmas,
+    days_to_next_holiday, days_from_last_holiday.
 
-    result = result.drop(columns=['month', 'quarter', 'day_of_week', 'week_of_year'])
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame đã có cột date (datetime64).
+    cfg : dict
+        Cấu hình pipeline.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame với các cột holiday được thêm vào.
+    """
+    if not cfg["features"]["vn_holidays"]["enabled"]:
+        logger.info("vn_holidays: DISABLED — bỏ qua")
+        return df
+
+    cols_before = df.shape[1]
+
+    # is_tet: broadcasting (N × M) để tìm khoảng cách tới mỗi Tết
+    tet_dates = pd.to_datetime(TET_NEW_YEAR_DATES)
+    date_vals = df["date"].values.astype("datetime64[D]")    # (N,)
+    tet_vals  = tet_dates.values.astype("datetime64[D]")     # (M,)
+
+    diff_matrix = np.abs(
+        date_vals[:, None].astype("int64") - tet_vals[None, :].astype("int64")
+    )  # (N, M), đơn vị ngày
+    min_days_to_tet = diff_matrix.min(axis=1)
+    df["is_tet"] = (min_days_to_tet <= 7).astype("int8")
+
+    # Ngày lễ cố định — vectorized
+    month_v = df["date"].dt.month.values
+    day_v   = df["date"].dt.day.values
+
+    df["is_30_4"]      = ((month_v == 4)  & (day_v == 30)).astype("int8")
+    df["is_1_5"]       = ((month_v == 5)  & (day_v == 1)).astype("int8")
+    df["is_2_9"]       = ((month_v == 9)  & (day_v == 2)).astype("int8")
+    df["is_christmas"] = ((month_v == 12) & (day_v == 25)).astype("int8")
+
+    # Gộp tất cả holiday cho mọi năm có mặt trong df
+    years = df["date"].dt.year.unique()
+    fixed_list: List[pd.Timestamp] = []
+    for yr in years:
+        fixed_list.extend([
+            pd.Timestamp(yr, 4, 30),
+            pd.Timestamp(yr, 5, 1),
+            pd.Timestamp(yr, 9, 2),
+            pd.Timestamp(yr, 12, 25),
+        ])
+
+    all_holidays = np.sort(np.unique(np.concatenate([
+        tet_vals,
+        np.array(fixed_list, dtype="datetime64[D]"),
+    ])))
+
+    date_int = date_vals.astype("int64")
+    holi_int = all_holidays.astype("int64")
+
+    # days_to_next_holiday — np.searchsorted
+    idx_next = np.searchsorted(holi_int, date_int, side="left")
+    idx_next_clipped = np.clip(idx_next, 0, len(holi_int) - 1)
+    days_to_next = holi_int[idx_next_clipped] - date_int
+    days_to_next = np.where(idx_next >= len(holi_int), 999, days_to_next)
+    df["days_to_next_holiday"] = days_to_next.astype("int16")
+
+    # days_from_last_holiday
+    idx_prev = np.searchsorted(holi_int, date_int, side="left") - 1
+    idx_prev_clipped = np.clip(idx_prev, 0, len(holi_int) - 1)
+    days_from_last = date_int - holi_int[idx_prev_clipped]
+    days_from_last = np.where(idx_prev < 0, 999, days_from_last)
+    df["days_from_last_holiday"] = days_from_last.astype("int16")
+
+    cols_added = df.shape[1] - cols_before
+    logger.info("[Nhóm A] build_vn_holidays: +%d cột", cols_added)
+    return df
+
+
+def build_fourier_seasonality(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    [Nhóm A] Thêm Fourier seasonality features: sin/cos cho các period 7, 30, 365.
+    Tính trên TOÀN BỘ 4,381 ngày — không có NaN, không shift.
+    Vectorized hoàn toàn bằng numpy.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame đã có cột date (datetime64).
+    cfg : dict
+        Cấu hình pipeline.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame với sin/cos features được thêm vào.
+    """
+    if not cfg["features"]["fourier_seasonality"]["enabled"]:
+        logger.info("fourier_seasonality: DISABLED — bỏ qua")
+        return df
+
+    cols_before = df.shape[1]
+    periods: List[int] = cfg["features"]["fourier_seasonality"]["periods"]
+    n_terms: int       = cfg["features"]["fourier_seasonality"]["n_terms"]
+
+    t = (df["date"] - df["date"].min()).dt.days.values.astype("float64")
+
+    for p in periods:
+        for k in range(1, n_terms + 1):
+            angle = 2.0 * np.pi * k * t / p
+            df[f"sin_{p}_{k}"] = np.sin(angle).astype("float32")
+            df[f"cos_{p}_{k}"] = np.cos(angle).astype("float32")
+
+    cols_added = df.shape[1] - cols_before
+    logger.info(
+        "[Nhóm A] build_fourier_seasonality: +%d cột (periods=%s, n_terms=%d)",
+        cols_added, periods, n_terms,
+    )
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Nhóm B — ĐÃ BỊ VÔ HIỆU HÓA
+# ---------------------------------------------------------------------------
+# Lý do: Horizon dự báo = 1.5 năm (548 ngày). Với horizon > 1 ngày:
+#   - shift(1) tại tập Test → NaN từ ngày thứ 2 trở đi → model không có input.
+#   - Các cột nguồn (gross_revenue, sessions, ...) là daily observables —
+#     không tồn tại ở tập Test thực tế → nếu giữ lại là 100% leakage.
+# Giải pháp: chỉ dùng Nhóm A (pure date-based) + Promotion Intensity
+# (được tái tạo từ quy luật chu kỳ, không phải observational data).
+#
+# Các hàm dưới đây được giữ lại trong codebase với trạng thái DISABLED
+# để tham khảo và có thể kích hoạt lại khi chuyển sang bài toán 1-step-ahead.
+# ---------------------------------------------------------------------------
+
+def build_lag_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    [Nhóm B — DISABLED] Lag và rolling features trên revenue/cogs.
+
+    VÔ HIỆU HÓA vĩnh viễn cho bài toán Horizon 1.5 năm.
+    shift(1) chỉ hợp lệ cho dự báo 1 ngày. Với Horizon > 1 ngày,
+    tập Test sẽ nhận NaN toàn bộ từ ngày thứ 2 trở đi.
+    Ngoài ra revenue/cogs là observed cols → leakage nếu còn trong Test.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame pipeline.
+    cfg : dict
+        Cấu hình pipeline (không dùng).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame không thay đổi.
+    """
+    logger.info(
+        "[Nhóm B] build_lag_features: DISABLED — "
+        "không tương thích với Horizon 1.5 năm (leakage + NaN toàn bộ Test)"
+    )
+    return df
+
+
+def build_macd_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    [Nhóm B — DISABLED] MACD features trên lag revenue.
+
+    VÔ HIỆU HÓA vĩnh viễn cho bài toán Horizon 1.5 năm.
+    MACD dựa trên revenue là observed col → leakage 100% vào Test.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame pipeline.
+    cfg : dict
+        Cấu hình pipeline (không dùng).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame không thay đổi.
+    """
+    logger.info(
+        "[Nhóm B] build_macd_features: DISABLED — "
+        "không tương thích với Horizon 1.5 năm (leakage + NaN toàn bộ Test)"
+    )
+    return df
+
+
+def build_price_discount_elasticity(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    [Nhóm B — DISABLED] Price Discount Elasticity features.
+
+    VÔ HIỆU HÓA vĩnh viễn cho bài toán Horizon 1.5 năm.
+    gross_revenue và total_discount là observed cols → leakage 100% vào Test.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame pipeline.
+    cfg : dict
+        Cấu hình pipeline (không dùng).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame không thay đổi.
+    """
+    logger.info(
+        "[Nhóm B] build_price_discount_elasticity: DISABLED — "
+        "không tương thích với Horizon 1.5 năm (leakage + NaN toàn bộ Test)"
+    )
+    return df
+
+
+def build_web_traffic_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    [Nhóm B — DISABLED] Web traffic lag features.
+
+    VÔ HIỆU HÓA vĩnh viễn cho bài toán Horizon 1.5 năm.
+    sessions, page_views, unique_visitors là observed cols → leakage 100%.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame pipeline.
+    cfg : dict
+        Cấu hình pipeline (không dùng).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame không thay đổi.
+    """
+    logger.info(
+        "[Nhóm B] build_web_traffic_features: DISABLED — "
+        "không tương thích với Horizon 1.5 năm (leakage + NaN toàn bộ Test)"
+    )
+    return df
+
+
+def build_inventory_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    [Nhóm B — DISABLED] Inventory lag features.
+
+    VÔ HIỆU HÓA vĩnh viễn cho bài toán Horizon 1.5 năm.
+    avg_fill_rate, avg_stockout_days... là observed cols → leakage 100%.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame pipeline.
+    cfg : dict
+        Cấu hình pipeline (không dùng).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame không thay đổi.
+    """
+    logger.info(
+        "[Nhóm B] build_inventory_features: DISABLED — "
+        "không tương thích với Horizon 1.5 năm (leakage + NaN toàn bộ Test)"
+    )
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Promotion Intensity — Nhóm A* (không shift, không leakage sau FIX 1)
+# ---------------------------------------------------------------------------
+
+def build_promotion_intensity(
+    df: pd.DataFrame,
+    promotions_df: pd.DataFrame,
+    cfg: dict,
+) -> pd.DataFrame:
+    """
+    [Nhóm A*] Tính Promotion Intensity Score (PIS) theo ngày trên 4,381 ngày.
+
+    Sau FIX 1, promotions_df đã được mở rộng sang 2023–2024 bằng chu kỳ 2 năm,
+    nên n_active_promos và pis_score sẽ có giá trị đầy đủ cho toàn bộ tập Test.
+    Không cần shift vì đây là thông tin lịch khuyến mãi (được lên kế hoạch trước),
+    không phải dữ liệu quan sát theo ngày.
+
+    Vectorized bằng broadcasting (N × M) — không có for-loop trên DataFrame.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame đã có cột date (4,381 ngày).
+    promotions_df : pd.DataFrame
+        DataFrame promotions đã chuẩn hóa và mở rộng chu kỳ.
+    cfg : dict
+        Cấu hình pipeline.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame với n_active_promos, max_discount_pct,
+        has_stackable_promo, pis_score được thêm vào.
+    """
+    if not cfg["features"]["promotion_intensity"]["enabled"]:
+        logger.info("promotion_intensity: DISABLED — bỏ qua")
+        return df
+
+    cols_before = df.shape[1]
+
+    date_arr  = df["date"].values.astype("datetime64[D]")                    # (N,)
+    start_arr = promotions_df["start_date"].values.astype("datetime64[D]")  # (M,)
+    end_arr   = promotions_df["end_date"].values.astype("datetime64[D]")    # (M,)
+
+    # active_matrix[i, j] = True nếu date[i] nằm trong khoảng promo[j]
+    active_matrix = (
+        (date_arr[:, None] >= start_arr[None, :]) &
+        (date_arr[:, None] <= end_arr[None, :])
+    )  # (N, M)
+
+    df["n_active_promos"] = active_matrix.sum(axis=1).astype("int8")
+
+    # max_discount_pct: chỉ promo loại percentage
+    is_pct      = (promotions_df["promo_type"].astype(str) == "percentage").values
+    disc_vals   = promotions_df["discount_value"].values.astype("float32")
+    disc_matrix = active_matrix * is_pct[None, :] * disc_vals[None, :]
+    df["max_discount_pct"] = disc_matrix.max(axis=1).astype("float32")
+
+    # has_stackable_promo
+    stackable_vals   = promotions_df["stackable_flag"].values.astype(bool)
+    stackable_active = active_matrix & stackable_vals[None, :]
+    df["has_stackable_promo"] = stackable_active.any(axis=1).astype("int8")
+
+    # pis_score = n_active × max_discount_pct
+    df["pis_score"] = df["n_active_promos"].astype("float32") * df["max_discount_pct"]
+
+    # Kiểm tra: tập Test (2023–2024) phải có ít nhất một ngày có promo
+    test_mask = df["date"] >= "2023-01-01"
+    n_promo_days_test = int((df.loc[test_mask, "n_active_promos"] > 0).sum())
+    logger.info(
+        "[Nhóm A*] build_promotion_intensity: +%d cột | "
+        "số ngày có promo trong Test (2023–2024): %d",
+        df.shape[1] - cols_before,
+        n_promo_days_test,
+    )
+    if n_promo_days_test == 0:
+        logger.warning(
+            "CẢNH BÁO: Không có ngày nào có promo trong Test — "
+            "kiểm tra lại load_promotions() và chu kỳ mở rộng"
+        )
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Split & Save
+# ---------------------------------------------------------------------------
+
+def split_and_save(
+    df: pd.DataFrame,
+    cfg: dict,
+    processed_dir: Path,
+) -> None:
+    """
+    Tách DataFrame 4,381 ngày thành train (≤2022-12-31) và test (≥2023-01-01).
+
+    Trước khi split, drop OBSERVED_COLS — các cột daily aggregates từ data_prep
+    (gross_revenue, sessions, page_views, ...) không tồn tại ở tập Test thực tế.
+    Giữ các cột này trong train/test sẽ gây Data Leakage 100% vì chúng tương quan
+    trực tiếp với target (revenue, cogs, margin).
+
+    Sau khi split, drop thêm TARGET_COLS khỏi test để triệt tiêu leakage target.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame full 4,381 ngày đã có tất cả features.
+    cfg : dict
+        Cấu hình pipeline.
+    processed_dir : Path
+        Thư mục output.
+
+    Returns
+    -------
+    None
+    """
+    train_end: str  = cfg["data"]["train_end"]   # "2022-12-31"
+    test_start: str = cfg["data"]["test_start"]  # "2023-01-01"
+
+    # Bước 1 — Drop OBSERVED_COLS trước khi split để triệt tiêu leakage
+    # Các cột này là daily observables: không tồn tại ở Test thực tế,
+    # và tương quan trực tiếp với target → leakage 100% nếu còn trong tập Train.
+    cols_before_drop = df.shape[1]
+    df = df.drop(columns=OBSERVED_COLS, errors="ignore")
+    cols_dropped = cols_before_drop - df.shape[1]
+    logger.info(
+        "Drop OBSERVED_COLS: %d cột bị xóa %s",
+        cols_dropped,
+        [c for c in OBSERVED_COLS if c in df.columns or True],
+    )
+
+    # Bước 2 — Tách train / test theo date
+    train_df = df[df["date"] <= train_end].copy()
+    test_df  = df[df["date"] >= test_start].copy()
+
+    # Bước 3 — Drop target khỏi test
+    test_df = test_df.drop(columns=TARGET_COLS, errors="ignore")
+
+    # Bước 4 — Validate shape
+    assert len(train_df) + len(test_df) == len(df), (
+        f"Mất dòng khi split: {len(train_df)} + {len(test_df)} != {len(df)}"
+    )
+    assert len(train_df) == 3833, (
+        f"Train phải có 3833 dòng, có {len(train_df)}"
+    )
+    assert len(test_df) == 548, (
+        f"Test phải có 548 dòng, có {len(test_df)}"
+    )
+
+    # Bước 5 — Validate không còn leakage target
+    assert "revenue" not in test_df.columns, "LEAKAGE: revenue còn trong test"
+    assert "cogs"    not in test_df.columns, "LEAKAGE: cogs còn trong test"
+    assert "margin"  not in test_df.columns, "LEAKAGE: margin còn trong test"
+
+    # Bước 6 — Validate không còn observed cols trong cả hai tập
+    leaked_train = [c for c in OBSERVED_COLS if c in train_df.columns]
+    leaked_test  = [c for c in OBSERVED_COLS if c in test_df.columns]
+    assert not leaked_train, f"LEAKAGE: observed cols còn trong train: {leaked_train}"
+    assert not leaked_test,  f"LEAKAGE: observed cols còn trong test:  {leaked_test}"
+
+    # Bước 7 — Validate Nhóm A không có NaN trong test
+    group_a_cols = [
+        c for c in test_df.columns
+        if any(c.startswith(p) for p in GROUP_A_PREFIXES) or c in (
+            "n_active_promos", "max_discount_pct", "has_stackable_promo", "pis_score"
+        )
+    ]
+    n_nan_a = int(test_df[group_a_cols].isna().sum().sum())
+    assert n_nan_a == 0, (
+        f"Nhóm A feature bị NaN trong tập Test ({n_nan_a} giá trị) — "
+        f"kiểm tra build_calendar_features / build_vn_holidays / "
+        f"build_fourier_seasonality / build_promotion_intensity"
+    )
 
     logger.info(
-        f"   [Nhóm 3] Seasonal Stats: {result.shape[1] - 1} features "
-        f"(fit trên {train_mask.sum()} ngày train)"
-    )
-    return result
-
-
-# ==========================================
-# NHÓM 4: PROMO CALENDAR FEATURES
-# ==========================================
-
-def build_promo_calendar_features(dates: pd.Series) -> pd.DataFrame:
-    """
-    Extrapolate lịch khuyến mãi từ pattern promotions.csv sang toàn bộ date range.
-
-    Pattern phát hiện từ 50 promo records (2013–2022) — lặp lại đều đặn:
-        Spring Sale   : 18/3 → 17/4,  percentage 12%,  mỗi năm
-        Mid-Year Sale : 23/6 → 22/7,  percentage 18%,  mỗi năm
-        Fall Launch   : 30/8 → 01/10, percentage 10%,  mỗi năm
-        Year-End Sale : 18/11 → 31/12, percentage 20%, mỗi năm
-        Urban Blowout : 30/7 → 02/9,  fixed 50,        năm lẻ (Streetwear)
-        Rural Special : 30/1 → 01/3,  percentage 15%,  năm lẻ (Outdoor)
-
-    Features:
-        is_promo_active          : Có ít nhất 1 promo đang chạy
-        n_active_promos          : Số promo đồng thời
-        max_discount_pct_active  : % discount cao nhất đang active
-        has_{spring/mid_year/fall/year_end/streetwear/outdoor}_promo : flags
-        days_to_next_promo       : Số ngày đến promo kế tiếp, clip [0, 180]
-        days_since_last_promo    : Số ngày kể từ promo cuối, clip [0, 180]
-
-    Args:
-        dates (pd.Series): Series kiểu datetime.
-
-    Returns:
-        pd.DataFrame: Promo calendar features với cột 'Date'.
-    """
-    min_year = dates.dt.year.min()
-    max_year = dates.dt.year.max()
-
-    records = []
-    for year in range(min_year, max_year + 1):
-        records += [
-            {'start': f'{year}-03-18', 'end': f'{year}-04-17', 'disc_pct': 12.0, 'flag': 'spring'},
-            {'start': f'{year}-06-23', 'end': f'{year}-07-22', 'disc_pct': 18.0, 'flag': 'mid_year'},
-            {'start': f'{year}-08-30', 'end': f'{year}-10-01', 'disc_pct': 10.0, 'flag': 'fall'},
-            {'start': f'{year}-11-18', 'end': f'{year}-12-31', 'disc_pct': 20.0, 'flag': 'year_end'},
-        ]
-        if year % 2 == 1:
-            records += [
-                {'start': f'{year}-07-30', 'end': f'{year}-09-02', 'disc_pct': 0.0,  'flag': 'streetwear'},
-                {'start': f'{year}-01-30', 'end': f'{year}-03-01', 'disc_pct': 15.0, 'flag': 'outdoor'},
-            ]
-
-    promos = pd.DataFrame(records)
-    promos['start'] = pd.to_datetime(promos['start'])
-    promos['end']   = pd.to_datetime(promos['end'])
-
-    result = pd.DataFrame({'Date': dates.values}).sort_values('Date').reset_index(drop=True)
-    flags  = ['spring', 'mid_year', 'fall', 'year_end', 'streetwear', 'outdoor']
-
-    result['is_promo_active']         = 0
-    result['n_active_promos']         = 0
-    result['max_discount_pct_active'] = 0.0
-    for f in flags:
-        result[f'has_{f}_promo'] = 0
-
-    for _, p in promos.iterrows():
-        mask = (result['Date'] >= p['start']) & (result['Date'] <= p['end'])
-        result.loc[mask, 'is_promo_active']          = 1
-        result.loc[mask, 'n_active_promos']         += 1
-        result.loc[mask, 'max_discount_pct_active']  = np.maximum(
-            result.loc[mask, 'max_discount_pct_active'], p['disc_pct']
-        )
-        result.loc[mask, f"has_{p['flag']}_promo"]  = 1
-
-    all_starts = sorted(promos['start'].tolist())
-    all_ends   = sorted(promos['end'].tolist())
-
-    result['days_to_next_promo'] = result['Date'].apply(
-        lambda d: min([(s - d).days for s in all_starts if s > d], default=999)
-    ).clip(0, 180)
-    result['days_since_last_promo'] = result['Date'].apply(
-        lambda d: min([(d - e).days for e in all_ends if e < d], default=999)
-    ).clip(0, 180)
-
-    logger.info(f"   [Nhóm 4] Promo Calendar: {result.shape[1] - 1} features")
-    return result
-
-
-# ==========================================
-# MERGE & EXPORT
-# ==========================================
-
-def _merge_all_features(
-    master   : pd.DataFrame,
-    calendar : pd.DataFrame,
-    yoy      : pd.DataFrame,
-    seasonal : pd.DataFrame,
-    promo    : pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Merge 4 nhóm feature vào một DataFrame và tách target.
-
-    Không split, không impute, không scale — trách nhiệm của validation.py.
-    Cột 'Date' được giữ trong X_full để validation.py tạo time-based mask.
-
-    Returns:
-        X_full (pd.DataFrame): Feature matrix toàn date spine (có cột 'Date').
-        y_full (pd.DataFrame): Target vector (Date, Revenue, COGS).
-    """
-    merged = (
-        master[['Date'] + TARGETS]
-        .merge(calendar, on='Date', how='left')
-        .merge(yoy,      on='Date', how='left')
-        .merge(seasonal, on='Date', how='left')
-        .merge(promo,    on='Date', how='left')
+        "Validate PASS — train: %d × %d | test: %d × %d",
+        len(train_df), train_df.shape[1],
+        len(test_df),  test_df.shape[1],
     )
 
-    feature_cols = [c for c in merged.columns if c not in ['Date'] + TARGETS]
+    # Bước 8 — Ghi file
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    train_path = processed_dir / "train_features.parquet"
+    test_path  = processed_dir / "test_features.parquet"
 
-    def _get_group(c):
-        if c in calendar.columns: return 'calendar'
-        if c in yoy.columns:      return 'yoy'
-        if c in promo.columns:    return 'promo'
-        return 'seasonal'
+    train_df.to_parquet(train_path, index=False)
+    test_df.to_parquet(test_path, index=False)
 
-    pd.DataFrame({
-        'feature_name' : feature_cols,
-        'group'        : [_get_group(c) for c in feature_cols],
-        'null_pct_raw' : [round(merged[c].isna().mean() * 100, 2) for c in feature_cols],
-    }).to_parquet(config.FEATURES / 'feature_metadata.parquet', index=False)
-
-    X_full = merged[['Date'] + feature_cols].copy()
-    y_full = merged[['Date'] + TARGETS].copy()
-
-    logger.info(f"   X_full: {X_full.shape} | y_full: {y_full.shape}")
-    logger.info(f"   NaN raw (trước imputation): {X_full[feature_cols].isna().sum().sum()}")
-    return X_full, y_full
-
-
-# ==========================================
-# ENTRY POINT
-# ==========================================
-
-def run_feature_engineering() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Pipeline chính: Load → Build 4 nhóm → Merge → Export X_full, y_full.
-
-    Returns:
-        (X_full, y_full) — chưa split, chưa impute, chưa scale.
-        Truyền thẳng vào validation.run_validation().
-
-    Raises:
-        FileNotFoundError: master_table.parquet chưa tồn tại.
-    """
-    logger.info("=" * 60)
-    logger.info("BẮT ĐẦU FEATURE ENGINEERING PIPELINE")
-    logger.info("=" * 60)
-
-    master_path = config.PROCESSED / 'master_table.parquet'
-    if not master_path.exists():
-        raise FileNotFoundError(
-            f"{master_path} không tồn tại. Chạy data_prep.run_prep() trước."
-        )
-    config.FEATURES.mkdir(parents=True, exist_ok=True)
-
-    logger.info("1. Load master_table...")
-    master = pd.read_parquet(master_path)
-    master['Date'] = pd.to_datetime(master['Date'])
-    master = master.sort_values('Date').reset_index(drop=True)
-
-    train_mask = (
-        (master['Date'] >= pd.Timestamp(TRAIN_START)) &
-        (master['Date'] <= pd.Timestamp(TRAIN_END))
+    logger.info(
+        "Đã ghi train_features: %d dòng × %d cột → %s",
+        len(train_df), train_df.shape[1], train_path,
     )
     logger.info(
-        f"   Train: {train_mask.sum()} ngày ({TRAIN_START} → {TRAIN_END}) | "
-        f"Full spine: {len(master)} ngày"
+        "Đã ghi test_features:  %d dòng × %d cột → %s",
+        len(test_df), test_df.shape[1], test_path,
     )
 
-    logger.info("2. Build Calendar Features (Nhóm 1)...")
-    calendar = build_calendar_features(master['Date'])
-    calendar.to_parquet(config.FEATURES / 'calendar_features.parquet', index=False)
 
-    logger.info("3. Build YoY Lag + Volatility Features (Nhóm 2)...")
-    yoy = build_yoy_features(master)
-    yoy.to_parquet(config.FEATURES / 'yoy_features.parquet', index=False)
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-    logger.info("4. Build Seasonal Stats (Nhóm 3)...")
-    seasonal = build_seasonal_stats(master, train_mask)
-    seasonal.to_parquet(config.FEATURES / 'seasonal_stats.parquet', index=False)
+def main() -> None:
+    """Điểm vào chính của feature_eng.py — tạo train/test feature parquet."""
+    args = parse_args()
+    cfg  = load_config(args.config)
+    setup_logging(cfg)
 
-    logger.info("5. Build Promo Calendar Features (Nhóm 4)...")
-    promo = build_promo_calendar_features(master['Date'])
-    promo.to_parquet(config.FEATURES / 'promo_calendar_features.parquet', index=False)
-
-    logger.info("6. Merge & Export...")
-    X_full, y_full = _merge_all_features(master, calendar, yoy, seasonal, promo)
-    X_full.to_parquet(config.FEATURES / 'X_full.parquet', index=False)
-    y_full.to_parquet(config.FEATURES / 'y_full.parquet', index=False)
+    raw_dir       = Path(cfg["paths"]["raw_dir"])
+    processed_dir = Path(cfg["paths"]["processed_dir"])
 
     logger.info("=" * 60)
-    logger.info("FEATURE ENGINEERING HOÀN TẤT ✅")
-    logger.info(f"  X_full : {X_full.shape} | y_full : {y_full.shape}")
-    logger.info(f"  Output : {config.FEATURES}")
+    logger.info("BẮT ĐẦU FEATURE ENGINEERING")
     logger.info("=" * 60)
 
-    return X_full, y_full
+    # --- Load ---
+    df            = load_base_table(processed_dir)
+    # FIX 1: promotions_df đã được mở rộng chu kỳ sang 2023–2024
+    promotions_df = load_promotions(raw_dir)
+
+    # -----------------------------------------------------------------------
+    # NHÓM A — tính trên 4,381 ngày, KHÔNG shift, không NaN trong Test
+    # -----------------------------------------------------------------------
+    logger.info("--- NHÓM A: Date-based Features (không shift, không NaN) ---")
+    df = build_calendar_features(df, cfg)
+    df = build_vn_holidays(df, cfg)
+    df = build_fourier_seasonality(df, cfg)
+
+    # -----------------------------------------------------------------------
+    # NHÓM B — VÔ HIỆU HÓA (FIX 2: không tương thích Horizon 1.5 năm)
+    # Các hàm vẫn được gọi nhưng chỉ log cảnh báo và return df nguyên vẹn.
+    # -----------------------------------------------------------------------
+    logger.info(
+        "--- NHÓM B: DISABLED (Horizon 1.5 năm — leakage + NaN toàn bộ Test) ---"
+    )
+    df = build_lag_features(df, cfg)
+    df = build_macd_features(df, cfg)
+    df = build_price_discount_elasticity(df, cfg)
+    df = build_web_traffic_features(df, cfg)
+    df = build_inventory_features(df, cfg)
+
+    # -----------------------------------------------------------------------
+    # PROMOTION INTENSITY — Nhóm A* (dùng promotions đã mở rộng chu kỳ)
+    # -----------------------------------------------------------------------
+    logger.info("--- PROMOTION INTENSITY (Nhóm A* — chu kỳ 2 năm) ---")
+    df = build_promotion_intensity(df, promotions_df, cfg)
+
+    # Downcast toàn bộ trừ target + date trước khi split
+    df = downcast_df(df, exclude_cols=TARGET_COLS + ["date"])
+
+    mem_mb = df.memory_usage(deep=True).sum() / 1e6
+    logger.info(
+        "Full feature DataFrame (trước split): %d dòng × %d cột | %.1f MB",
+        df.shape[0], df.shape[1], mem_mb,
+    )
+
+    # -----------------------------------------------------------------------
+    # SPLIT & SAVE — FIX 2: drop OBSERVED_COLS trước khi split
+    # -----------------------------------------------------------------------
+    logger.info("--- SPLIT & SAVE ---")
+    split_and_save(df, cfg, processed_dir)
+
+    logger.info("=" * 60)
+    logger.info("FEATURE ENGINEERING HOÀN TẤT")
+    logger.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
