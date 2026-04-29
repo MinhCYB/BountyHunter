@@ -341,7 +341,9 @@ def build_submission(
         rev_preds = _predict_prophet(model_rev, df, feature_cols)
         mar_preds = _predict_prophet(model_mar, df, feature_cols)
     else:
-        X_test = df[feature_cols]
+        X_test = df[feature_cols].copy()
+        drop_cols = ["sample_weight", "is_covid_period"]
+        X_test = X_test.drop(columns=[c for c in drop_cols if c in X_test.columns])
         rev_preds = _predict_sklearn(model_rev, X_test)
         mar_preds = _predict_sklearn(model_mar, X_test)
 

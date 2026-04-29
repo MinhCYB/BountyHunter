@@ -55,11 +55,9 @@ OBSERVED_COLS: List[str] = [
     "avg_session_duration_sec",
     "n_items_sold",
     "avg_order_value",
-    "sessions",
     "page_views",
     "unique_visitors",
     "bounce_rate",
-    "avg_fill_rate",
     "avg_stockout_days",
     "pct_stockout_skus",
     "avg_sell_through",
@@ -91,6 +89,7 @@ GROUP_A_PREFIXES: Tuple[str, ...] = (
     "day_", "week_", "month", "quarter", "year",
     "is_", "days_to_", "days_from_", "sin_", "cos_", "trend_",
     "n_active_promos", "max_discount_pct", "has_stackable_promo", "pis_score",
+    "inventory_", "expected_",
 )
 
 
@@ -641,55 +640,143 @@ def build_price_discount_elasticity(df: pd.DataFrame, cfg: dict) -> pd.DataFrame
 
 def build_web_traffic_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """
-    [Nhóm B — DISABLED] Web traffic lag features.
-
-    VÔ HIỆU HÓA vĩnh viễn cho bài toán Horizon 1.5 năm.
-    sessions, page_views, unique_visitors là observed cols → leakage 100%.
+    [Nhóm B] Web traffic lag features.
+    Sử dụng shift(1) để tránh leakage.
 
     Parameters
     ----------
     df : pd.DataFrame
         DataFrame pipeline.
     cfg : dict
-        Cấu hình pipeline (không dùng).
+        Cấu hình pipeline.
 
     Returns
     -------
     pd.DataFrame
-        DataFrame không thay đổi.
+        DataFrame đã thêm lag features.
     """
-    logger.info(
-        "[Nhóm B] build_web_traffic_features: DISABLED — "
-        "không tương thích với Horizon 1.5 năm (leakage + NaN toàn bộ Test)"
-    )
+    wt_cfg = cfg["features"]["web_traffic_features"]
+    if not wt_cfg["enabled"]:
+        logger.info("web_traffic_features disabled — skipping")
+        return df
+
+    cols_before = df.shape[1]
+    df["sessions_lag1"] = df["sessions"].shift(1)
+    
+    cols_added = df.shape[1] - cols_before
+    logger.info("[Nhóm B] build_web_traffic_features: +%d cột", cols_added)
     return df
 
 
 def build_inventory_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """
-    [Nhóm B — DISABLED] Inventory lag features.
-
-    VÔ HIỆU HÓA vĩnh viễn cho bài toán Horizon 1.5 năm.
-    avg_fill_rate, avg_stockout_days... là observed cols → leakage 100%.
+    [Nhóm B] Inventory lag features.
+    Sử dụng shift(1) để tránh leakage.
 
     Parameters
     ----------
     df : pd.DataFrame
         DataFrame pipeline.
     cfg : dict
-        Cấu hình pipeline (không dùng).
+        Cấu hình pipeline.
 
     Returns
     -------
     pd.DataFrame
-        DataFrame không thay đổi.
+        DataFrame đã thêm lag features.
     """
-    logger.info(
-        "[Nhóm B] build_inventory_features: DISABLED — "
-        "không tương thích với Horizon 1.5 năm (leakage + NaN toàn bộ Test)"
-    )
+    inv_cfg = cfg["features"]["inventory_features"]
+    if not inv_cfg["enabled"]:
+        logger.info("inventory_features disabled — skipping")
+        return df
+
+    cols_before = df.shape[1]
+    df["avg_fill_rate_lag1m"] = df["avg_fill_rate"].shift(1)
+    
+    cols_added = df.shape[1] - cols_before
+    logger.info("[Nhóm B] build_inventory_features: +%d cột", cols_added)
     return df
 
+
+def build_killer_features(df: pd.DataFrame, promotions_df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    [Nhóm B] Thêm 2 Killer Features: Promotion Anticipation và Inventory Stress Index.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame pipeline.
+    promotions_df : pd.DataFrame
+        Dữ liệu khuyến mãi.
+    cfg : dict
+        Cấu hình pipeline.
+        
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame đã thêm killer features.
+    """
+    kill_cfg = cfg["features"]["killer_features"]
+    if not kill_cfg["enabled"]:
+        logger.info("killer_features disabled — skipping")
+        return df
+
+    cols_before = df.shape[1]
+    
+    # 1. Promotion Anticipation
+    threshold = kill_cfg["promo_discount_threshold"]
+    lookahead = kill_cfg["promo_lookahead_days"]
+    
+    major_promos = promotions_df[
+        (promotions_df["discount_value"] >= threshold) &
+        (promotions_df["promo_type"] == "percentage")
+    ].copy()
+    
+    # Cross join date với major_promos
+    dates_df = df[["date"]].copy()
+    dates_df["_key"] = 1
+    major_promos["_key"] = 1
+    
+    cross = pd.merge(dates_df, major_promos[["_key", "start_date", "discount_value"]], on="_key")
+    
+    # Lọc tránh Leakage
+    cond1 = cross["start_date"] > cross["date"]
+    cond2 = (cross["start_date"] - cross["date"]).dt.days <= lookahead
+    valid_cross = cross[cond1 & cond2].copy()
+    
+    valid_cross["days_to"] = (valid_cross["start_date"] - valid_cross["date"]).dt.days
+    valid_cross = valid_cross.sort_values(["date", "days_to"])
+    closest = valid_cross.groupby("date").first().reset_index()
+    
+    df = pd.merge(df, closest[["date", "days_to", "discount_value"]], on="date", how="left")
+    df["days_to_next_major_promo"] = df["days_to"].fillna(999).astype("int32")
+    df["expected_discount_depth"] = df["discount_value"].fillna(0.0).astype("float32")
+    df["is_within_promo_window"] = (df["days_to_next_major_promo"] <= lookahead).astype("int8")
+    
+    df = df.drop(columns=["days_to", "discount_value"])
+    
+    # 2. Inventory Stress Index
+    floor = kill_cfg["fill_rate_floor"]
+    fill_rate_clipped = df["avg_fill_rate_lag1m"].clip(lower=floor, upper=1.0)
+    sessions_clipped = df["sessions_lag1"].clip(lower=1.0)
+    
+    stress_idx = np.log1p(sessions_clipped) - np.log(fill_rate_clipped)
+    df["inventory_stress_index"] = stress_idx.astype("float32")
+    df["is_stockout_stress"] = (df["avg_fill_rate_lag1m"] < floor).astype("int8")
+    
+    # Logic Cứu Tập Test (Neutral Imputation)
+    train_end = pd.Timestamp(cfg["data"]["train_end"])
+    train_mask = df["date"] <= train_end
+    
+    median_stress = float(df.loc[train_mask, "inventory_stress_index"].median())
+    df["inventory_stress_index"] = df["inventory_stress_index"].fillna(median_stress)
+    
+    df["sessions_lag1"] = df["sessions_lag1"].fillna(0.0)
+    df["avg_fill_rate_lag1m"] = df["avg_fill_rate_lag1m"].fillna(0.0)
+    
+    cols_added = df.shape[1] - cols_before
+    logger.info("[Nhóm B] build_killer_features: +%d cột", cols_added)
+    return df
 
 # ---------------------------------------------------------------------------
 # Promotion Intensity — Nhóm A* (không shift, không leakage sau FIX 1)
@@ -942,6 +1029,9 @@ def main() -> None:
     # -----------------------------------------------------------------------
     logger.info("--- PROMOTION INTENSITY (Nhóm A* — chu kỳ 2 năm) ---")
     df = build_promotion_intensity(df, promotions_df, cfg)
+
+    logger.info("--- KILLER FEATURES (Promo Anticipation & Inventory Stress) ---")
+    df = build_killer_features(df, promotions_df, cfg)
 
     # Downcast toàn bộ trừ target + date trước khi split
     df = downcast_df(df, exclude_cols=TARGET_COLS + ["date"])

@@ -198,7 +198,7 @@ features:
     enabled: true
 
   web_traffic_features:
-    enabled: false
+    enabled: true
     # Aggregate web_traffic.csv theo ngày, shift(1)
     cols:
       - "sessions_lag1"
@@ -209,7 +209,13 @@ features:
       - "page_views_roll7_mean"
 
   inventory_features:
-    enabled: false
+    enabled: true
+
+  killer_features:
+    enabled: true
+    promo_discount_threshold: 20.0
+    promo_lookahead_days: 90
+    fill_rate_floor: 0.01
     # Monthly snapshot — forward-fill sang ngày, shift(1)
     cols:
       - "avg_fill_rate_lag1m"
@@ -234,5 +240,5 @@ explainability:
 
 # --- Logging ---
 logging:
-  level: "INFO"                     # DEBUG | INFO | WARNING | ERROR
+  level: "DEBUG"                     # DEBUG | INFO | WARNING | ERROR
   format: "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
