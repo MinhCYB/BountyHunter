@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, List, Tuple
 
 import pandas as pd
+import numpy as np
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,54 @@ def _predict_prophet(
     return pd.Series(forecast["yhat"].values, index=df_test.index)
 
 
+def _postprocess_predictions(
+    result: pd.DataFrame,
+    df_train_stats: dict,
+    cfg: dict,
+) -> pd.DataFrame:
+    """
+    Post-process predictions: clip and winsorize.
+    Đọc cấu hình từ cfg["post_processing"].
+    
+    Parameters
+    ----------
+    result : pd.DataFrame
+        DataFrame kết quả với các cột Revenue và margin_pred.
+    df_train_stats : dict
+        Dictionary chứa thống kê từ train (revenue_p99).
+    cfg : dict
+        Cấu hình pipeline đầy đủ.
+        
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame kết quả sau khi xử lý.
+    """
+    pp_cfg = cfg["post_processing"]
+    if not pp_cfg["enabled"]:
+        logger.info("post_processing disabled — skipping")
+        return result
+
+    # 1. Clip Revenue âm
+    result["Revenue"] = result["Revenue"].clip(lower=pp_cfg["revenue_clip_lower"])
+    
+    # 2. Clip Margin
+    result["margin_pred"] = result["margin_pred"].clip(
+        pp_cfg["margin_clip_lower"], pp_cfg["margin_clip_upper"]
+    )
+    
+    # 3. Winsorize Revenue
+    if pp_cfg["revenue_winsorize_enabled"]:
+        multiplier = pp_cfg["revenue_winsorize_multiplier"]
+        upper_bound = df_train_stats["revenue_p99"] * multiplier
+        result["Revenue"] = result["Revenue"].clip(upper=upper_bound)
+        
+    # 4. Recompute COGS
+    result["COGS"] = result["Revenue"] * result["margin_pred"]
+    
+    return result
+
+
 def build_submission(
     df: pd.DataFrame,
     model_rev: Any,
@@ -253,6 +302,7 @@ def build_submission(
     feature_cols: List[str],
     date_col: str,
     sample_sub_path: Path,
+    df_train_stats: dict,
     cfg: dict,
 ) -> pd.DataFrame:
     """
@@ -272,6 +322,8 @@ def build_submission(
         Tên cột date trong feature_table.
     sample_sub_path : Path
         Đường dẫn sample_submission.csv.
+    df_train_stats : dict
+        Dictionary chứa thống kê train (ví dụ: revenue_p99).
     cfg : dict
         Config đầy đủ.
 
@@ -293,11 +345,17 @@ def build_submission(
         rev_preds = _predict_sklearn(model_rev, X_test)
         mar_preds = _predict_sklearn(model_mar, X_test)
 
-    # Tính COGS = Revenue × Margin
+    # Inverse log-transform Revenue; margin được train trên raw nên không transform
+    rev_preds = np.expm1(rev_preds)
+
+    # Khởi tạo result
     result = df[[date_col]].copy()
     result["Revenue"] = rev_preds.values
     result["margin_pred"] = mar_preds.values
     result["COGS"] = result["Revenue"] * result["margin_pred"]
+
+    # Post-process (clip and winsorize)
+    result = _postprocess_predictions(result, df_train_stats, cfg)
     result = result.rename(columns={date_col: "Date"})
     result["Date"] = pd.to_datetime(result["Date"])
 
@@ -458,6 +516,16 @@ def main() -> None:
     # Load feature_cols đúng thứ tự từ lúc train
     feature_cols = load_feature_cols(model_dir)
 
+    # Load train stats
+    import json
+    train_stats_path = processed_dir / "train_stats.json"
+    if train_stats_path.exists():
+        with open(train_stats_path, "r", encoding="utf-8") as f:
+            df_train_stats = json.load(f)
+    else:
+        logger.warning("Không tìm thấy train_stats.json, dùng fallback revenue_p99 = inf")
+        df_train_stats = {"revenue_p99": float("inf")}
+
     # Build submission
     submission = build_submission(
         df=df_test,
@@ -466,6 +534,7 @@ def main() -> None:
         feature_cols=feature_cols,
         date_col="date",
         sample_sub_path=sample_sub_path,
+        df_train_stats=df_train_stats,
         cfg=cfg,
     )
 
