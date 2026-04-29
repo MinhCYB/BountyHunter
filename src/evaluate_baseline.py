@@ -140,7 +140,12 @@ def main() -> None:
     
     cv_folds_metrics = []
     logger.info("--- Bắt đầu đánh giá CV ---")
-    for i, (df_tr, df_val) in enumerate(expanding_window_cv(df_train_full, cfg), 1):
+    cv_cfg = cfg["cv"]
+    n_splits = cv_cfg["n_splits"]
+    min_train_days = cv_cfg["min_train_days"]
+    
+    cv_gen = expanding_window_cv(df_train_full, "date", n_splits, min_train_days)
+    for i, (df_tr, df_val) in enumerate(cv_gen, 1):
         preds = predict_naive_baseline(df_val, df, target_revenue)
         
         valid_mask = preds.notna() & df_val[target_revenue].notna()
