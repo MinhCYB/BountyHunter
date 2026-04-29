@@ -41,9 +41,18 @@ TARGET_COLS: List[str] = ["revenue", "cogs", "margin"]
 # Đây là dữ liệu QUAN SÁT THEO NGÀY — không tồn tại ở tập Test thực tế.
 # Phải drop trước khi split để triệt tiêu 100% leakage.
 OBSERVED_COLS: List[str] = [
+    "year",
     "gross_revenue",
     "total_discount",
     "n_orders",
+    "n_unique_customers",
+    "n_unique_products",
+    "cancelled_rate",
+    "n_returns",
+    "total_refund",
+    "avg_rating",
+    "n_reviews",
+    "avg_session_duration_sec",
     "n_items_sold",
     "avg_order_value",
     "sessions",
@@ -57,6 +66,7 @@ OBSERVED_COLS: List[str] = [
     "unit_price",
     "quantity",
     "discount_amount",
+    "avg_delivery_days"
 ]
 
 # Ngày mùng 1 Tết Nguyên Đán (Dương lịch) hardcode cho 2012–2024.
@@ -794,11 +804,18 @@ def split_and_save(
     train_df.to_parquet(train_path, index=False)
     test_df.to_parquet(test_path, index=False)
 
+    try: 
+        fackk = train_df.columns
+        
+        gluglu = pd.DataFrame(fackk) 
+        gluglu.to_csv(processed_dir / "gluglu.csv") 
+    except Exception as e: 
+        print(f"{type(fackk)} đìt còn mè")
     logger.info(
         "Đã ghi train_features: %d dòng × %d cột → %s",
         len(train_df), train_df.shape[1], train_path,
     )
-    logger.info(
+    logger.info( 
         "Đã ghi test_features:  %d dòng × %d cột → %s",
         len(test_df), test_df.shape[1], test_path,
     )

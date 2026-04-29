@@ -300,6 +300,7 @@ def _fit_predict_sklearn(
             X_train,
             y_train,
             eval_set=[(X_val, df_val[target])],
+            verbose=False
         )
     elif model_name == "catboost":
         model.fit(

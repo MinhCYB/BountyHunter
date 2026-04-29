@@ -591,8 +591,6 @@ def main() -> None:
     output_path = processed_dir / "base_table.parquet"
     base_table.to_parquet(output_path, index=False)
 
-    meta = base_table.columns 
-    print(meta)
     logger.info("Đã ghi base_table ra %s", output_path)
     logger.info("Data Prep hoàn tất")
 
