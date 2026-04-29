@@ -302,8 +302,9 @@ def _fit_predict_sklearn(
     X_val = df_val[feature_cols]
 
     # FIX-3a: log-transform target to stabilise variance
-    y_train = np.log1p(y_train)
-    y_val_log = np.log1p(df_val[target])
+    _use_log = target in ("revenue", "cogs")
+    y_train   = np.log1p(y_train)          if _use_log else y_train
+    y_val_log = np.log1p(df_val[target])   if _use_log else df_val[target]
 
     if model_name in ("lightgbm", "xgboost"):
         model.fit(
@@ -323,7 +324,11 @@ def _fit_predict_sklearn(
 
     preds = model.predict(X_val)
     # FIX-3b: inverse log-transform predictions
-    preds = np.expm1(preds)
+    preds = np.expm1(preds) if _use_log else preds
+    
+    if target == "margin":
+        preds = np.clip(preds, 0.0, 1.0)
+        
     return preds
 
 
@@ -503,13 +508,18 @@ def train_final_model(
         y = df[target]
 
         # FIX-4: carve out a temporal hold-out to re-enable early stopping
-        holdout_n = max(1, int(len(X) * 0.10))
-        X_tr, X_val = X.iloc[:-holdout_n], X.iloc[-holdout_n:]
-        y_tr, y_val = y.iloc[:-holdout_n], y.iloc[-holdout_n:]
+        holdout_cutoff = df["date"].quantile(0.90, interpolation="nearest")
+        mask_tr  = df["date"] <  holdout_cutoff
+        mask_val = df["date"] >= holdout_cutoff
+        X_tr  = df.loc[mask_tr,  feature_cols]
+        X_val = df.loc[mask_val, feature_cols]
+        y_tr  = df.loc[mask_tr,  target]
+        y_val = df.loc[mask_val, target]
 
         # FIX-3a: log-transform target to stabilise variance
-        y_train_log = np.log1p(y_tr)
-        y_val_log = np.log1p(y_val)
+        _use_log   = target in ("revenue", "cogs")
+        y_train_log = np.log1p(y_tr)   if _use_log else y_tr
+        y_val_log   = np.log1p(y_val)  if _use_log else y_val
 
         if model_name == "lightgbm":
             from lightgbm import LGBMRegressor
@@ -543,7 +553,10 @@ def train_final_model(
 
         predictions = model.predict(X)
         # FIX-3b: inverse log-transform predictions
-        predictions = np.expm1(predictions)
+        predictions = np.expm1(predictions) if _use_log else predictions
+        
+        if target == "margin":
+            predictions = np.clip(predictions, 0.0, 1.0)
 
     logger.info("Đã huấn luyện final model [%s] cho target '%s'", model_name, target)
     return model
@@ -794,6 +807,17 @@ def main() -> None:
 
     # Lưu CV metrics
     save_cv_metrics(all_cv_metrics, run_dir / "cv_metrics.json")
+
+    # Lưu train_stats.json cho post-processing
+    train_stats = {
+        "revenue_p99": float(df_train_full[target_revenue].quantile(0.99)),
+        "revenue_p05": float(df_train_full[target_revenue].quantile(0.05)),
+        "margin_mean": float(df_train_full[target_margin].mean())
+    }
+    with open(processed_dir / "train_stats.json", "w", encoding="utf-8") as f:
+        import json
+        json.dump(train_stats, f, indent=2)
+    logger.info("Đã lưu train_stats.json")
 
     logger.info("Pipeline train hoàn tất. Model lưu tại: %s", run_dir)
 
