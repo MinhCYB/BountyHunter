@@ -654,25 +654,14 @@ class HybridRegressor:
         """
         allowed_groups = self.cfg["hybrid"]["residual"]["feature_groups"]
         
-        GROUP_PREFIX_MAP = {
-            "base_time_features" : ["day_", "week_", "month", "quarter",
-                                     "year", "is_weekend", "is_month",
-                                     "is_quarter"],
-            "fourier_seasonality": ["fourier_"],
-            "cyclical_features"  : ["sin_", "cos_"],
-            "vn_holidays"        : ["is_tet", "is_30_4", "is_1_5",
-                                     "is_2_9", "is_christmas",
-                                     "days_to_next_holiday",
-                                     "days_from_last_holiday"],
-            "promotion_intensity": ["n_active_", "max_discount_",
-                                     "has_stackable_", "pis_"],
-            "trend_features"     : ["trend_"],
-        }
+        prefix_map = self.cfg["hybrid"]["residual"].get("feature_prefixes", {})
         
         allowed_prefixes = []
         for group in allowed_groups:
-            if group in GROUP_PREFIX_MAP:
-                allowed_prefixes.extend(GROUP_PREFIX_MAP[group])
+            if group in prefix_map:
+                allowed_prefixes.extend(prefix_map[group])
+            else:
+                logger.warning("Feature group '%s' not found in feature_prefixes config.", group)
 
         filtered_cols = [
             col for col in all_feature_cols 
@@ -706,7 +695,10 @@ class HybridRegressor:
         self._fit_trend(df, target)
         trend_preds = self._predict_trend(df)
         
-        residuals = df[target].values - trend_preds
+        if target in ("revenue", "cogs"):
+            residuals = np.log1p(df[target].values) - np.log1p(trend_preds)
+        else:
+            residuals = df[target].values - trend_preds
         
         res_cfg = self.cfg["hybrid"]["residual_clip"]
         if res_cfg["enabled"]:
@@ -720,7 +712,10 @@ class HybridRegressor:
         
         if eval_df is not None:
             eval_trend = self._predict_trend(eval_df)
-            eval_resid = eval_df[target].values - eval_trend
+            if target in ("revenue", "cogs"):
+                eval_resid = np.log1p(eval_df[target].values) - np.log1p(eval_trend)
+            else:
+                eval_resid = eval_df[target].values - eval_trend
             eval_set = [(eval_df[self.residual_cols_], eval_resid)]
         else:
             eval_set = None
@@ -751,7 +746,11 @@ class HybridRegressor:
         """
         trend_preds = self._predict_trend(df)
         resid_preds = self.residual_model_.predict(df[self.residual_cols_])
-        final = trend_preds + resid_preds
+        
+        if self.target_ in ("revenue", "cogs"):
+            final = np.expm1(np.log1p(trend_preds) + resid_preds)
+        else:
+            final = trend_preds + resid_preds
         
         logger.info(
             "Predict mean - trend: %.2f | residual: %.2f | final: %.2f",

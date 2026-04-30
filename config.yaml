@@ -160,9 +160,9 @@ features:
   base_lag_features:
     enabled: true
     lag_days:
-      - 365
-      - 366
-      - 367
+      - 730
+      - 731
+      - 732
     rolling_windows:
       - 7
       - 14
@@ -209,7 +209,7 @@ features:
       - "page_views_roll7_mean"
 
   inventory_features:
-    enabled: true
+    enabled: false
 
   killer_features:
     enabled: true
@@ -252,7 +252,7 @@ logging:
   format: "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
 
 hybrid:
-  enabled: false
+  enabled: true
   trend_model: "prophet"           # prophet | ridge — dùng ridge trước để
                                   # validate nhanh, switch prophet sau
   residual_model: "xgboost"
@@ -274,7 +274,17 @@ hybrid:
       - "fourier_seasonality"
       - "cyclical_features"
       - "vn_holidays"
-      # lag_features, web_traffic, inventory KHÔNG được include
+      # - "base_lag_features"
+      - "killer_features"
+    feature_prefixes:
+      base_time_features: ["day_", "week_", "month", "quarter", "year", "is_weekend", "is_month", "is_quarter"]
+      fourier_seasonality: ["sin_", "cos_"]
+      cyclical_features: ["sin_", "cos_"]
+      vn_holidays: ["is_tet", "is_30_4", "is_1_5", "is_2_9", "is_christmas", "days_to_next_holiday", "days_from_last_holiday"]
+      promotion_intensity: ["n_active_", "max_discount_", "has_stackable_", "pis_"]
+      trend_features: ["trend_"]
+      base_lag_features: ["lag_", "roll"]
+      killer_features: ["days_to_next_major_promo", "expected_discount", "is_within", "inventory_stress", "is_stockout"]
 
   residual_clip:
     enabled: true

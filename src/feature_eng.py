@@ -756,23 +756,24 @@ def build_killer_features(df: pd.DataFrame, promotions_df: pd.DataFrame, cfg: di
     df = df.drop(columns=["days_to", "discount_value"])
     
     # 2. Inventory Stress Index
-    floor = kill_cfg["fill_rate_floor"]
-    fill_rate_clipped = df["avg_fill_rate_lag1m"].clip(lower=floor, upper=1.0)
-    sessions_clipped = df["sessions_lag1"].clip(lower=1.0)
-    
-    stress_idx = np.log1p(sessions_clipped) - np.log(fill_rate_clipped)
-    df["inventory_stress_index"] = stress_idx.astype("float32")
-    df["is_stockout_stress"] = (df["avg_fill_rate_lag1m"] < floor).astype("int8")
-    
-    # Logic Cứu Tập Test (Neutral Imputation)
-    train_end = pd.Timestamp(cfg["data"]["train_end"])
-    train_mask = df["date"] <= train_end
-    
-    median_stress = float(df.loc[train_mask, "inventory_stress_index"].median())
-    df["inventory_stress_index"] = df["inventory_stress_index"].fillna(median_stress)
-    
-    df["sessions_lag1"] = df["sessions_lag1"].fillna(0.0)
-    df["avg_fill_rate_lag1m"] = df["avg_fill_rate_lag1m"].fillna(0.0)
+    if "avg_fill_rate_lag1m" in df.columns and "sessions_lag1" in df.columns:
+        floor = kill_cfg["fill_rate_floor"]
+        fill_rate_clipped = df["avg_fill_rate_lag1m"].clip(lower=floor, upper=1.0)
+        sessions_clipped = df["sessions_lag1"].clip(lower=1.0)
+        
+        stress_idx = np.log1p(sessions_clipped) - np.log(fill_rate_clipped)
+        df["inventory_stress_index"] = stress_idx.astype("float32")
+        df["is_stockout_stress"] = (df["avg_fill_rate_lag1m"] < floor).astype("int8")
+        
+        # Logic Cứu Tập Test (Neutral Imputation)
+        train_end = pd.Timestamp(cfg["data"]["train_end"])
+        train_mask = df["date"] <= train_end
+        
+        median_stress = float(df.loc[train_mask, "inventory_stress_index"].median())
+        df["inventory_stress_index"] = df["inventory_stress_index"].fillna(median_stress)
+        
+        df["sessions_lag1"] = df["sessions_lag1"].fillna(0.0)
+        df["avg_fill_rate_lag1m"] = df["avg_fill_rate_lag1m"].fillna(0.0)
     
     cols_added = df.shape[1] - cols_before
     logger.info("[Nhóm B] build_killer_features: +%d cột", cols_added)
@@ -951,6 +952,25 @@ def split_and_save(
         f"build_fourier_seasonality / build_promotion_intensity"
     )
 
+    # Bước 7.5 — Validate historical lag features
+    lag_cfg = cfg.get("features", {}).get("base_lag_features", {})
+    if lag_cfg.get("enabled", False):
+        lag_days_list = lag_cfg.get("lag_days", [])
+        rolling_windows = lag_cfg.get("rolling_windows", [])
+        rolling_aggs = lag_cfg.get("rolling_aggs", ["mean", "std", "min", "max"])
+        lag_cols = []
+        for d in lag_days_list:
+            lag_cols.append(f"lag_{d}")
+        for w in rolling_windows:
+            for agg in rolling_aggs:
+                lag_cols.append(f"roll{w}_{agg}")
+            
+        lag_cols = [c for c in lag_cols if c in test_df.columns]
+        if lag_cols:
+            n_nan_lag = int(test_df[lag_cols].isna().sum().sum())
+            if n_nan_lag > 0:
+                raise AssertionError(f"Nhóm A Historical lag feature bị NaN trong tập Test ({n_nan_lag} giá trị)")
+
     logger.info(
         "Validate PASS — train: %d × %d | test: %d × %d",
         len(train_df), train_df.shape[1],
@@ -978,6 +998,84 @@ def split_and_save(
         len(test_df), test_df.shape[1], test_path,
     )
 
+
+def build_historical_lag_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    Thêm historical lag features bằng cách lookup thay vì shift.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame chứa tất cả các ngày.
+    cfg : dict
+        Config dict.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame với historical lag features đã thêm.
+    """
+    lag_cfg = cfg.get("features", {}).get("base_lag_features", {})
+    if not lag_cfg.get("enabled", False):
+        return df
+
+    cols_before = df.shape[1]
+    lag_days_list = lag_cfg.get("lag_days", [365, 366, 367])
+    rolling_windows = lag_cfg.get("rolling_windows", [7, 14, 30, 90])
+    rolling_aggs = lag_cfg.get("rolling_aggs", ["mean", "std", "min", "max"])
+    
+    # Chuẩn bị lookup DF
+    lookup_df = df[["date", "revenue"]].copy()
+    lookup_df["revenue_log"] = np.log1p(lookup_df["revenue"])
+    
+    # 1. Tạo features
+    for lag_days in lag_days_list:
+        col_name = f"lag_{lag_days}"
+        tmp = lookup_df[["date", "revenue_log"]].copy()
+        tmp["date"] = tmp["date"] + pd.Timedelta(days=lag_days)
+        tmp = tmp.rename(columns={"revenue_log": col_name})
+        df = pd.merge(df, tmp, on="date", how="left")
+        
+    lookup_roll = lookup_df.set_index("date")[["revenue_log"]].sort_index()
+    for window in rolling_windows:
+        roll_obj = lookup_roll["revenue_log"].rolling(window=window, min_periods=1)
+        for agg in rolling_aggs:
+            col_name = f"roll{window}_{agg}"
+            if agg == "mean":
+                lookup_roll[col_name] = roll_obj.mean()
+            elif agg == "std":
+                lookup_roll[col_name] = roll_obj.std()
+            elif agg == "min":
+                lookup_roll[col_name] = roll_obj.min()
+            elif agg == "max":
+                lookup_roll[col_name] = roll_obj.max()
+        
+    lookup_roll = lookup_roll.reset_index()
+    # Tịnh tiến rolling năm ngoái (shift lag cơ sở) vào hiện tại
+    base_lag = min(lag_days_list) if lag_days_list else 365
+    lookup_roll["date"] = lookup_roll["date"] + pd.Timedelta(days=base_lag)
+    lookup_roll = lookup_roll.drop(columns=["revenue_log"])
+    
+    df = pd.merge(df, lookup_roll, on="date", how="left")
+    
+    # 2. Fill NaN bằng median của Train set TRƯỚC split
+    train_end = pd.Timestamp(cfg["data"]["train_end"])
+    train_mask = df["date"] <= train_end
+    
+    new_cols = [f"lag_{d}" for d in lag_days_list]
+    for window in rolling_windows:
+        for agg in rolling_aggs:
+            new_cols.append(f"roll{window}_{agg}")
+        
+    for c in new_cols:
+        if c in df.columns:
+            median_val = float(df.loc[train_mask, c].median())
+            df[c] = df[c].fillna(median_val)
+            df[c] = df[c].astype("float32")
+            
+    cols_added = df.shape[1] - cols_before
+    logger.info("[Nhóm A] build_historical_lag_features: +%d cột", cols_added)
+    return df
 
 def build_covid_weights(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """
@@ -1038,6 +1136,9 @@ def main() -> None:
     df = build_trend_features(df, cfg)
     df = build_vn_holidays(df, cfg)
     df = build_fourier_seasonality(df, cfg)
+
+    # NHÓM A: Historical lag lookup (hợp lệ cho cả test set)
+    df = build_historical_lag_features(df, cfg)
 
     # -----------------------------------------------------------------------
     # NHÓM B — VÔ HIỆU HÓA (FIX 2: không tương thích Horizon 1.5 năm)

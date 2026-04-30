@@ -384,24 +384,24 @@ def build_submission(
 
     logger.info("Số feature dùng cho inference: %d", len(feature_cols))
 
+    is_hybrid = cfg.get("hybrid", {}).get("enabled", False)
+
     # Predict
     if model_name == "prophet":
         rev_preds = _predict_prophet(model_rev, df, feature_cols)
         mar_preds = _predict_prophet(model_mar, df, feature_cols)
+    elif is_hybrid:
+        rev_preds = pd.Series(model_rev.predict(df), index=df.index)
+        mar_preds = pd.Series(model_mar.predict(df), index=df.index)
     else:
-        if cfg.get("hybrid", {}).get("enabled", False):
-            # Hybrid model takes full df
-            rev_preds = pd.Series(model_rev.predict(df), index=df.index)
-            mar_preds = pd.Series(model_mar.predict(df), index=df.index)
-        else:
-            X_test = df[feature_cols].copy()
-            drop_cols = ["sample_weight", "is_covid_period"]
-            X_test = X_test.drop(columns=[c for c in drop_cols if c in X_test.columns])
-            rev_preds = _predict_sklearn(model_rev, X_test)
-            mar_preds = _predict_sklearn(model_mar, X_test)
-
-    # Inverse log-transform Revenue; margin được train trên raw nên không transform
-    rev_preds = np.expm1(rev_preds)
+        X_test = df[feature_cols].copy()
+        drop_cols = ["sample_weight", "is_covid_period"]
+        X_test = X_test.drop(columns=[c for c in drop_cols if c in X_test.columns])
+        
+        rev_preds = _predict_sklearn(model_rev, X_test)
+        mar_preds = _predict_sklearn(model_mar, X_test)
+        
+        rev_preds = np.expm1(rev_preds)
 
     # Khởi tạo result
     result = df[[date_col]].copy()
