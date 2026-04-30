@@ -235,8 +235,8 @@ post_processing:
   revenue_winsorize_multiplier: 2.0    # upper_bound = revenue_p99 * multiplier
 
 covid_period:
-  enabled: true
-  start: "2020-02-01"      # configurable, không hardcode trong code
+  enabled: false
+  start: "2020-04-06"      # configurable, không hardcode trong code
   end:   "2021-12-31"      # configurable
   sample_weight: 0.1       # trọng số cho ngày COVID, sweep sau nếu cần
 

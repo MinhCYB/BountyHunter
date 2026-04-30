@@ -23,6 +23,8 @@ import pandas as pd
 import numpy as np
 import yaml
 
+from train import HybridRegressor
+
 logger = logging.getLogger(__name__)
 
 
@@ -107,14 +109,18 @@ def _find_latest_model_dir(base_model_dir: Path) -> Path:
     return latest
 
 
-def load_model(model_dir: Path) -> Tuple[Any, Any]:
+def load_model(model_dir: Path, cfg: dict = None, feature_cols: List[str] = None) -> Tuple[Any, Any]:
     """
-    Load model_revenue.pkl và model_margin.pkl từ thư mục model.
+    Load model_revenue.pkl và model_margin.pkl từ thư mục model (hoặc HybridRegressor).
 
     Parameters
     ----------
     model_dir : Path
         Thư mục chứa hai file pkl.
+    cfg : dict, optional
+        Config đầy đủ
+    feature_cols : List[str], optional
+        Danh sách feature cols
 
     Returns
     -------
@@ -126,6 +132,48 @@ def load_model(model_dir: Path) -> Tuple[Any, Any]:
     FileNotFoundError
         Nếu thiếu một trong hai file model.
     """
+    meta_path = model_dir / "metadata.json"
+    is_hybrid = False
+    train_date_min_str = None
+    if meta_path.exists():
+        import json
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        is_hybrid = meta.get("hybrid_enabled", False)
+        train_date_min_str = meta.get("train_date_min")
+
+    if is_hybrid:
+        path_trend_rev = model_dir / "model_trend_revenue.pkl"
+        path_resid_rev = model_dir / "model_residual_revenue.pkl"
+        path_trend_mar = model_dir / "model_trend_margin.pkl"
+        path_resid_mar = model_dir / "model_residual_margin.pkl"
+
+        for p in (path_trend_rev, path_resid_rev, path_trend_mar, path_resid_mar):
+            if not p.exists():
+                raise FileNotFoundError(f"Không tìm thấy model file: {p}")
+
+        with open(path_trend_rev, "rb") as f: trend_rev = pickle.load(f)
+        with open(path_resid_rev, "rb") as f: resid_rev = pickle.load(f)
+        with open(path_trend_mar, "rb") as f: trend_mar = pickle.load(f)
+        with open(path_resid_mar, "rb") as f: resid_mar = pickle.load(f)
+
+        hybrid_rev = HybridRegressor(cfg)
+        hybrid_rev.trend_model_ = trend_rev
+        hybrid_rev.residual_model_ = resid_rev
+        hybrid_rev.target_ = cfg["data"]["target_revenue"] if cfg else "revenue"
+        hybrid_rev.train_date_min_ = pd.Timestamp(train_date_min_str) if train_date_min_str else None
+        hybrid_rev.residual_cols_ = hybrid_rev._get_residual_feature_cols(feature_cols) if feature_cols else []
+
+        hybrid_mar = HybridRegressor(cfg)
+        hybrid_mar.trend_model_ = trend_mar
+        hybrid_mar.residual_model_ = resid_mar
+        hybrid_mar.target_ = cfg["data"]["target_margin"] if cfg else "margin_pred"
+        hybrid_mar.train_date_min_ = pd.Timestamp(train_date_min_str) if train_date_min_str else None
+        hybrid_mar.residual_cols_ = hybrid_mar._get_residual_feature_cols(feature_cols) if feature_cols else []
+
+        logger.info("Đã load Hybrid models từ: %s", model_dir)
+        return hybrid_rev, hybrid_mar
+
     path_rev = model_dir / "model_revenue.pkl"
     path_mar = model_dir / "model_margin.pkl"
 
@@ -341,11 +389,16 @@ def build_submission(
         rev_preds = _predict_prophet(model_rev, df, feature_cols)
         mar_preds = _predict_prophet(model_mar, df, feature_cols)
     else:
-        X_test = df[feature_cols].copy()
-        drop_cols = ["sample_weight", "is_covid_period"]
-        X_test = X_test.drop(columns=[c for c in drop_cols if c in X_test.columns])
-        rev_preds = _predict_sklearn(model_rev, X_test)
-        mar_preds = _predict_sklearn(model_mar, X_test)
+        if cfg.get("hybrid", {}).get("enabled", False):
+            # Hybrid model takes full df
+            rev_preds = pd.Series(model_rev.predict(df), index=df.index)
+            mar_preds = pd.Series(model_mar.predict(df), index=df.index)
+        else:
+            X_test = df[feature_cols].copy()
+            drop_cols = ["sample_weight", "is_covid_period"]
+            X_test = X_test.drop(columns=[c for c in drop_cols if c in X_test.columns])
+            rev_preds = _predict_sklearn(model_rev, X_test)
+            mar_preds = _predict_sklearn(model_mar, X_test)
 
     # Inverse log-transform Revenue; margin được train trên raw nên không transform
     rev_preds = np.expm1(rev_preds)
@@ -492,8 +545,11 @@ def main() -> None:
     else:
         model_dir = _find_latest_model_dir(base_model_dir)
 
+    # Load feature_cols đúng thứ tự từ lúc train
+    feature_cols = load_feature_cols(model_dir)
+
     # Load model
-    model_revenue, model_margin = load_model(model_dir)
+    model_revenue, model_margin = load_model(model_dir, cfg, feature_cols)
 
     # Load feature_table
     df = load_feature_table(processed_dir)
@@ -514,9 +570,6 @@ def main() -> None:
     if len(df_test) == 0:
         logger.error("Tập test rỗng — kiểm tra lại test_start và test_end trong config")
         return
-
-    # Load feature_cols đúng thứ tự từ lúc train
-    feature_cols = load_feature_cols(model_dir)
 
     # Load train stats
     import json

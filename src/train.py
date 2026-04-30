@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
         default=Path("config.yaml"),
         help="Đường dẫn tới file config.yaml",
     )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Chạy nhanh để test lỗi runtime",
+    )
     return parser.parse_args()
 
 
@@ -229,6 +234,15 @@ def expanding_window_cv(
         ].copy()
 
         logger.debug(
+            "Fold %d: train đến %s | val %s – %s | train_size=%d val_size=%d",
+            fold + 1,
+            train_cutoff,
+            val_start,
+            val_end,
+            len(df_train),
+            len(df_val),
+        )
+        logger.info(
             "Fold %d: train đến %s | val %s – %s | train_size=%d val_size=%d",
             fold + 1,
             train_cutoff,
@@ -436,11 +450,20 @@ def run_cv(
     for fold_idx, (df_train, df_val) in enumerate(
         tqdm(cv_gen, desc=f"CV [{target}]", total=n_splits)
     ):
-        model = get_model(model_name, model_cfg, seed)
-
-        if model_name == "prophet":
+        if cfg.get("hybrid", {}).get("enabled", False):
+            hybrid = HybridRegressor(cfg)
+            hybrid.fit(
+                df=df_train,
+                target=target,
+                feature_cols=feature_cols,
+                eval_df=df_val,
+            )
+            y_pred = hybrid.predict(df_val)
+        elif model_name == "prophet":
+            model = get_model(model_name, model_cfg, seed)
             y_pred = _fit_predict_prophet(model, df_train, df_val, feature_cols, target)
         else:
+            model = get_model(model_name, model_cfg, seed)
             y_pred = _fit_predict_sklearn(
                 model, df_train, df_val, feature_cols, target, model_name, cfg
             )
@@ -480,6 +503,263 @@ def run_cv(
     }
 
 
+class HybridRegressor:
+    """
+    Sklearn-compatible Hybrid: TrendModel (Ridge/Prophet) +
+    XGBoost Residual Learner.
+
+    fit() nhận full train DataFrame, tự tách trend và residual.
+    predict() trả về trend_pred + residual_pred dưới dạng np.ndarray.
+    Toàn bộ caller (CV loop, inference) chỉ thấy .fit() và .predict().
+    """
+
+    def __init__(self, cfg: dict) -> None:
+        """
+        Khởi tạo HybridRegressor.
+
+        Parameters
+        ----------
+        cfg : dict
+            Full config dict đọc từ config.yaml.
+        """
+        self.cfg = cfg
+        self.trend_model_ = None
+        self.residual_model_ = None
+        self.residual_cols_: List[str] = []
+        self.trend_model_name = cfg["hybrid"]["trend_model"]
+        self.train_date_min_: pd.Timestamp | None = None
+        self.target_: str | None = None
+
+    def _build_trend_model(self) -> Any:
+        """
+        Khởi tạo model cho phần trend.
+
+        Returns
+        -------
+        Any
+            Model object (Ridge hoặc Prophet).
+        """
+        name = self.trend_model_name
+        if name == "ridge":
+            from sklearn.linear_model import Ridge
+            alpha = self.cfg["hybrid"]["trend"]["ridge"]["alpha"]
+            return Ridge(alpha=alpha)
+        elif name == "prophet":
+            from prophet import Prophet
+            params = self.cfg["hybrid"]["trend"]["prophet"]
+            return Prophet(**params)
+        else:
+            raise ValueError(f"Trend model không hợp lệ: {name}")
+
+    def _fit_trend(self, df: pd.DataFrame, target: str) -> None:
+        """
+        Huấn luyện model phần trend.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame huấn luyện.
+        target : str
+            Tên cột mục tiêu.
+        """
+        self.target_ = target
+        self.train_date_min_ = df["date"].min()
+
+        if target in ("revenue", "cogs"):
+            y = np.log1p(df[target].values)
+        else:
+            y = df[target].values
+
+        if self.trend_model_name == "ridge":
+            trend_index = (df["date"] - self.train_date_min_).dt.days.values
+            X_trend = pd.DataFrame({"trend_index": trend_index})
+            X_trend["trend_index_sq"] = X_trend["trend_index"] ** 2
+            
+            X_trend["sin_365_1"] = np.sin(2 * np.pi * trend_index / 365)
+            X_trend["cos_365_1"] = np.cos(2 * np.pi * trend_index / 365)
+            X_trend["sin_365_2"] = np.sin(4 * np.pi * trend_index / 365)
+            X_trend["cos_365_2"] = np.cos(4 * np.pi * trend_index / 365)
+
+            self.trend_model_.fit(X_trend, y)
+        elif self.trend_model_name == "prophet":
+            df_prophet = df[["date", target]].copy()
+            df_prophet = df_prophet.rename(columns={"date": "ds"})
+            df_prophet["y"] = y
+            self.trend_model_.fit(df_prophet)
+
+    def _predict_trend(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Dự báo bằng model phần trend.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame cần dự báo.
+
+        Returns
+        -------
+        np.ndarray
+            Mảng chứa giá trị dự báo từ trend.
+        """
+        if self.trend_model_name == "ridge":
+            trend_index = (df["date"] - self.train_date_min_).dt.days.values
+            X_trend = pd.DataFrame({"trend_index": trend_index})
+            X_trend["trend_index_sq"] = X_trend["trend_index"] ** 2
+            
+            X_trend["sin_365_1"] = np.sin(2 * np.pi * trend_index / 365)
+            X_trend["cos_365_1"] = np.cos(2 * np.pi * trend_index / 365)
+            X_trend["sin_365_2"] = np.sin(4 * np.pi * trend_index / 365)
+            X_trend["cos_365_2"] = np.cos(4 * np.pi * trend_index / 365)
+
+            raw_preds = self.trend_model_.predict(X_trend)
+        elif self.trend_model_name == "prophet":
+            future = df[["date"]].copy()
+            future = future.rename(columns={"date": "ds"})
+            forecast = self.trend_model_.predict(future)
+            raw_preds = forecast["yhat"].values
+
+        if self.target_ in ("revenue", "cogs"):
+            return np.expm1(raw_preds)
+        else:
+            return raw_preds
+
+    def _build_residual_model(self) -> Any:
+        """
+        Khởi tạo model cho phần residual.
+
+        Returns
+        -------
+        Any
+            Model object XGBoost.
+        """
+        from xgboost import XGBRegressor
+        params = self.cfg["models"]["xgboost"]
+        final_params = {k: v for k, v in params.items() if k != "early_stopping_rounds"}
+        final_params["early_stopping_rounds"] = params.get("early_stopping_rounds", 50)
+        return XGBRegressor(**final_params, random_state=self.cfg["models"]["random_seed"], tree_method="hist")
+
+    def _get_residual_feature_cols(self, all_feature_cols: List[str]) -> List[str]:
+        """
+        Lọc các cột feature dành cho phần residual.
+
+        Parameters
+        ----------
+        all_feature_cols : List[str]
+            Danh sách tất cả các cột feature.
+
+        Returns
+        -------
+        List[str]
+            Danh sách các cột feature được giữ lại cho residual.
+        """
+        allowed_groups = self.cfg["hybrid"]["residual"]["feature_groups"]
+        
+        GROUP_PREFIX_MAP = {
+            "base_time_features" : ["day_", "week_", "month", "quarter",
+                                     "year", "is_weekend", "is_month",
+                                     "is_quarter"],
+            "fourier_seasonality": ["fourier_"],
+            "cyclical_features"  : ["sin_", "cos_"],
+            "vn_holidays"        : ["is_tet", "is_30_4", "is_1_5",
+                                     "is_2_9", "is_christmas",
+                                     "days_to_next_holiday",
+                                     "days_from_last_holiday"],
+            "promotion_intensity": ["n_active_", "max_discount_",
+                                     "has_stackable_", "pis_"],
+            "trend_features"     : ["trend_"],
+        }
+        
+        allowed_prefixes = []
+        for group in allowed_groups:
+            if group in GROUP_PREFIX_MAP:
+                allowed_prefixes.extend(GROUP_PREFIX_MAP[group])
+
+        filtered_cols = [
+            col for col in all_feature_cols 
+            if any(col.startswith(prefix) for prefix in allowed_prefixes)
+        ]
+        
+        logger.info("Số cột residual được giữ lại: %d", len(filtered_cols))
+        return filtered_cols
+
+    def fit(self, df: pd.DataFrame, target: str, feature_cols: List[str], eval_df: pd.DataFrame | None = None) -> "HybridRegressor":
+        """
+        Huấn luyện mô hình Hybrid.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame huấn luyện.
+        target : str
+            Tên cột mục tiêu.
+        feature_cols : List[str]
+            Danh sách tất cả feature columns.
+        eval_df : pd.DataFrame | None, optional
+            DataFrame dùng cho validation, by default None.
+
+        Returns
+        -------
+        HybridRegressor
+            Mô hình đã được huấn luyện.
+        """
+        self.trend_model_ = self._build_trend_model()
+        self._fit_trend(df, target)
+        trend_preds = self._predict_trend(df)
+        
+        residuals = df[target].values - trend_preds
+        
+        res_cfg = self.cfg["hybrid"]["residual_clip"]
+        if res_cfg["enabled"]:
+            lo = np.quantile(residuals, res_cfg["lower_quantile"])
+            hi = np.quantile(residuals, res_cfg["upper_quantile"])
+            residuals = np.clip(residuals, lo, hi)
+            logger.info("Residual clip: [%.2f, %.2f]", lo, hi)
+            
+        self.residual_cols_ = self._get_residual_feature_cols(feature_cols)
+        X_resid = df[self.residual_cols_]
+        
+        if eval_df is not None:
+            eval_trend = self._predict_trend(eval_df)
+            eval_resid = eval_df[target].values - eval_trend
+            eval_set = [(eval_df[self.residual_cols_], eval_resid)]
+        else:
+            eval_set = None
+            
+        self.residual_model_ = self._build_residual_model()
+        
+        if eval_set is not None:
+            self.residual_model_.fit(X_resid, residuals, eval_set=eval_set, verbose=False)
+        else:
+            self.residual_model_.fit(X_resid, residuals, verbose=False)
+            
+        logger.info("Fit summary: trend_model=%s, residual_features=%d", self.trend_model_name, len(self.residual_cols_))
+        return self
+
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Dự báo.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame cần dự báo.
+
+        Returns
+        -------
+        np.ndarray
+            Mảng chứa giá trị dự báo.
+        """
+        trend_preds = self._predict_trend(df)
+        resid_preds = self.residual_model_.predict(df[self.residual_cols_])
+        final = trend_preds + resid_preds
+        
+        logger.info(
+            "Predict mean - trend: %.2f | residual: %.2f | final: %.2f",
+            float(np.mean(trend_preds)), float(np.mean(resid_preds)), float(np.mean(final))
+        )
+        return final
+
+
 # ---------------------------------------------------------------------------
 # 6. Final Training
 # ---------------------------------------------------------------------------
@@ -509,6 +789,23 @@ def train_final_model(
     Any
         Model đã fit.
     """
+    if cfg.get("hybrid", {}).get("enabled", False):
+        holdout_cutoff = df["date"].quantile(0.90, interpolation="nearest")
+        mask_tr  = df["date"] <  holdout_cutoff
+        mask_val = df["date"] >= holdout_cutoff
+        df_tr = df.loc[mask_tr].copy()
+        df_val = df.loc[mask_val].copy()
+
+        model = HybridRegressor(cfg)
+        model.fit(
+            df=df_tr,
+            target=target,
+            feature_cols=feature_cols,
+            eval_df=df_val,
+        )
+        logger.info("Đã huấn luyện final model [Hybrid] cho target '%s'", target)
+        return model
+
     model_name: str = cfg["models"]["active"]
     seed: int = cfg["models"]["random_seed"]
     model_cfg: dict = cfg["models"][model_name]
@@ -534,7 +831,7 @@ def train_final_model(
         X_val = df.loc[mask_val, feature_cols].copy()
         y_tr  = df.loc[mask_tr,  target]
         y_val = df.loc[mask_val, target]
-
+        
         sw_train = X_tr["sample_weight"].values if "sample_weight" in X_tr.columns else None
         sw_val = X_val["sample_weight"].values if "sample_weight" in X_val.columns else None
 
@@ -812,6 +1109,17 @@ def main() -> None:
 
     feature_cols = get_feature_cols(df_train_full, TARGET_COLS, "date")
 
+    if getattr(args, "smoke_test", False):
+        logger.info("SMOKE TEST MODE: Giảm dữ liệu và epoch")
+        df_train_full = df_train_full.tail(1000).copy()
+        cfg["cv"]["n_splits"] = 1
+        if "xgboost" in cfg["models"]:
+            cfg["models"]["xgboost"]["n_estimators"] = 10
+        if "catboost" in cfg["models"]:
+            cfg["models"]["catboost"]["iterations"] = 10
+        if "lightgbm" in cfg["models"]:
+            cfg["models"]["lightgbm"]["n_estimators"] = 10
+
     model_name: str = cfg["models"]["active"]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = model_dir / f"{model_name}_{timestamp}"
@@ -830,18 +1138,47 @@ def main() -> None:
         logger.info("Bắt đầu final training cho target: %s", target)
         final_model = train_final_model(df_train_full, feature_cols, target, cfg)
 
-        model_filename = f"model_{target}.pkl"
-        save_model(final_model, run_dir / model_filename)
+        if cfg.get("hybrid", {}).get("enabled", False):
+            save_model(final_model.trend_model_, run_dir / f"model_trend_{target}.pkl")
+            save_model(final_model.residual_model_, run_dir / f"model_residual_{target}.pkl")
+            
+            meta_path = run_dir / "metadata.json"
+            meta = {}
+            if meta_path.exists():
+                import json
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            meta["hybrid_enabled"] = True
+            meta["train_date_min"] = str(final_model.train_date_min_)
+            import json
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+        else:
+            model_filename = f"model_{target}.pkl"
+            save_model(final_model, run_dir / model_filename)
 
         # SHAP
-        if cfg["explainability"]["shap_enabled"] and model_name != "prophet":
-            seed: int = cfg["models"]["random_seed"]
-            shap_n: int = cfg["explainability"]["shap_sample_size"]
-            X_sample = df_train_full[feature_cols].sample(
-                n=min(shap_n, len(df_train_full)),
-                random_state=seed,
-            )
-            compute_shap(final_model, X_sample, cfg, output_dir, target)
+        is_hybrid = cfg.get("hybrid", {}).get("enabled", False)
+        if cfg["explainability"]["shap_enabled"]:
+            if is_hybrid:
+                shap_model = final_model.residual_model_
+                shap_cols = final_model.residual_cols_
+                valid_model = True
+            elif model_name != "prophet":
+                shap_model = final_model
+                shap_cols = feature_cols
+                valid_model = True
+            else:
+                valid_model = False
+
+            if valid_model:
+                seed: int = cfg["models"]["random_seed"]
+                shap_n: int = cfg["explainability"]["shap_sample_size"]
+                X_sample = df_train_full[shap_cols].sample(
+                    n=min(shap_n, len(df_train_full)),
+                    random_state=seed,
+                )
+                compute_shap(shap_model, X_sample, cfg, output_dir, target)
 
     # Lưu feature_cols để inference load lại đúng thứ tự
     save_feature_cols(feature_cols, run_dir / "feature_cols.json")
