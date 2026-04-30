@@ -214,7 +214,7 @@ features:
   killer_features:
     enabled: true
     promo_discount_threshold: 20.0
-    promo_lookahead_days: 90
+    promo_lookahead_days: 14
     fill_rate_floor: 0.01
     # Monthly snapshot — forward-fill sang ngày, shift(1)
     cols:
@@ -222,6 +222,8 @@ features:
       - "avg_stockout_days_lag1m"
       - "pct_stockout_skus_lag1m"
       - "avg_sell_through_lag1m"
+
+
 
 # --- Post Processing ---
 post_processing:
@@ -232,6 +234,12 @@ post_processing:
   revenue_winsorize_enabled: true      # Bật/tắt winsorize Revenue cao bất thường
   revenue_winsorize_multiplier: 2.0    # upper_bound = revenue_p99 * multiplier
 
+covid_period:
+  enabled: true
+  start: "2020-02-01"      # configurable, không hardcode trong code
+  end:   "2021-12-31"      # configurable
+  sample_weight: 0.1       # trọng số cho ngày COVID, sweep sau nếu cần
+
 # --- SHAP ---
 explainability:
   shap_enabled: true
@@ -240,5 +248,35 @@ explainability:
 
 # --- Logging ---
 logging:
-  level: "DEBUG"                     # DEBUG | INFO | WARNING | ERROR
+  level: "INFO"                     # DEBUG | INFO | WARNING | ERROR
   format: "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+
+hybrid:
+  enabled: false
+  trend_model: "prophet"           # prophet | ridge — dùng ridge trước để
+                                  # validate nhanh, switch prophet sau
+  residual_model: "xgboost"
+
+  trend:
+    prophet:
+      seasonality_mode: "multiplicative"
+      yearly_seasonality: true
+      weekly_seasonality: true
+      daily_seasonality: false
+      changepoint_prior_scale: 0.05
+      seasonality_prior_scale: 10.0
+    ridge:
+      alpha: 1.0
+
+  residual:
+    feature_groups:              # CHỈ các nhóm này được dùng cho XGBoost
+      - "base_time_features"
+      - "fourier_seasonality"
+      - "cyclical_features"
+      - "vn_holidays"
+      # lag_features, web_traffic, inventory KHÔNG được include
+
+  residual_clip:
+    enabled: true
+    lower_quantile: 0.01
+    upper_quantile: 0.99
