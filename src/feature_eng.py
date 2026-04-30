@@ -979,6 +979,34 @@ def split_and_save(
     )
 
 
+def build_covid_weights(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """
+    Thêm cột is_covid_period và sample_weight dựa trên config.
+    """
+    covid_cfg = cfg.get("covid_period", {})
+    if not covid_cfg.get("enabled", False):
+        logger.info("[Covid Weight] disabled — skipping")
+        return df
+
+    start = pd.Timestamp(covid_cfg["start"])
+    end = pd.Timestamp(covid_cfg["end"])
+    weight = covid_cfg["sample_weight"]
+
+    df["is_covid_period"] = (
+        (df["date"] >= start) & (df["date"] <= end)
+    ).astype("int8")
+
+    df["sample_weight"] = np.where(
+        df["is_covid_period"] == 1, weight, 1.0
+    ).astype("float32")
+
+    logger.info(
+        "[Covid Weight] enabled: %s -> %s, weight=%.2f",
+        start.date(), end.date(), weight
+    )
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1032,6 +1060,9 @@ def main() -> None:
 
     logger.info("--- KILLER FEATURES (Promo Anticipation & Inventory Stress) ---")
     df = build_killer_features(df, promotions_df, cfg)
+
+    logger.info("--- COVID WEIGHTS ---")
+    df = build_covid_weights(df, cfg)
 
     # Downcast toàn bộ trừ target + date trước khi split
     df = downcast_df(df, exclude_cols=TARGET_COLS + ["date"])
