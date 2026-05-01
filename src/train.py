@@ -213,8 +213,8 @@ def expanding_window_cv(
     total_days = len(all_dates)
 
     # FIX-2: fix val_size to match real forecast horizon (~1.5 years)
-    VAL_SIZE = 500  # approx 500 days ≈ 1.5 years; tune if needed
-    MIN_TRAIN_SIZE = VAL_SIZE * 2
+    VAL_SIZE = 90
+    MIN_TRAIN_SIZE = 365
 
     for fold in range(n_splits):
         val_end_idx = total_days - fold * VAL_SIZE
@@ -557,10 +557,7 @@ class HybridRegressor:
         self.target_ = target
         self.train_date_min_ = df["date"].min()
 
-        if target in ("revenue", "cogs"):
-            y = np.log1p(df[target].values)
-        else:
-            y = df[target].values
+        y = df[target].values
 
         if self.trend_model_name == "ridge":
             trend_index = (df["date"] - self.train_date_min_).dt.days.values
@@ -610,10 +607,7 @@ class HybridRegressor:
             forecast = self.trend_model_.predict(future)
             raw_preds = forecast["yhat"].values
 
-        if self.target_ in ("revenue", "cogs"):
-            return np.expm1(raw_preds)
-        else:
-            return raw_preds
+        return raw_preds
 
     def _build_residual_model(self) -> Any:
         """
@@ -687,10 +681,7 @@ class HybridRegressor:
         self._fit_trend(df, target)
         trend_preds = self._predict_trend(df)
         
-        if target in ("revenue", "cogs"):
-            residuals = np.log1p(df[target].values) - np.log1p(trend_preds)
-        else:
-            residuals = df[target].values - trend_preds
+        residuals = df[target].values - trend_preds
         
         res_cfg = self.cfg["hybrid"]["residual_clip"]
         if res_cfg["enabled"]:
@@ -704,10 +695,7 @@ class HybridRegressor:
         
         if eval_df is not None:
             eval_trend = self._predict_trend(eval_df)
-            if target in ("revenue", "cogs"):
-                eval_resid = np.log1p(eval_df[target].values) - np.log1p(eval_trend)
-            else:
-                eval_resid = eval_df[target].values - eval_trend
+            eval_resid = eval_df[target].values - eval_trend
             eval_set = [(eval_df[self.residual_cols_], eval_resid)]
         else:
             eval_set = None
@@ -739,10 +727,7 @@ class HybridRegressor:
         trend_preds = self._predict_trend(df)
         resid_preds = self.residual_model_.predict(df[self.residual_cols_])
         
-        if self.target_ in ("revenue", "cogs"):
-            final = np.expm1(np.log1p(trend_preds) + resid_preds)
-        else:
-            final = trend_preds + resid_preds
+        final = trend_preds + resid_preds
         
         logger.info(
             "Predict mean - trend: %.2f | residual: %.2f | final: %.2f",

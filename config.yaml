@@ -13,7 +13,7 @@ paths:
 
 # --- Cấu hình dữ liệu ---
 data:
-  train_start: "2012-07-04"
+  train_start: "2021-01-01"
   train_end: "2022-12-31"
   test_start: "2023-01-01"
   test_end: "2024-07-01"
@@ -59,8 +59,8 @@ models:
     verbose: -1
 
   xgboost:
-    n_estimators: 300
-    learning_rate: 0.05
+    n_estimators: 1000
+    learning_rate: 0.01
     max_depth: 6
     min_child_weight: 5
     subsample: 0.8
@@ -158,7 +158,7 @@ features:
       - "is_quarter_end"
 
   base_lag_features:
-    enabled: true
+    enabled: false
     lag_days:
       - 365
       - 366
@@ -198,7 +198,7 @@ features:
     enabled: true
 
   web_traffic_features:
-    enabled: false
+    enabled: true
     # Aggregate web_traffic.csv theo ngày, shift(1)
     cols:
       - "sessions_lag1"
@@ -252,18 +252,18 @@ logging:
   format: "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
 
 hybrid:
-  enabled: false
+  enabled: true
   trend_model: "prophet"           # prophet | ridge — dùng ridge trước để
                                   # validate nhanh, switch prophet sau
   residual_model: "xgboost"
 
   trend:
     prophet:
-      seasonality_mode: "multiplicative"
+      seasonality_mode: "additive"    # additive | multiplicative
       yearly_seasonality: true
       weekly_seasonality: true
       daily_seasonality: false
-      changepoint_prior_scale: 0.05
+      changepoint_prior_scale: 0.15
       seasonality_prior_scale: 10.0
     ridge:
       alpha: 1.0

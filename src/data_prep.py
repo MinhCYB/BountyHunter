@@ -467,7 +467,7 @@ def build_base_table(
 # Validate
 # ---------------------------------------------------------------------------
 
-def validate_base_table(df: pd.DataFrame) -> None:
+def validate_base_table(df: pd.DataFrame, cfg: dict) -> None:
     """
     Kiểm tra tính toàn vẹn của base_table trước khi ghi ra file.
 
@@ -481,8 +481,8 @@ def validate_base_table(df: pd.DataFrame) -> None:
     AssertionError
         Nếu bất kỳ điều kiện nào không thỏa mãn.
     """
-    expected_start = pd.Timestamp("2012-07-04")
-    expected_end = pd.Timestamp("2024-07-01")
+    expected_start = pd.Timestamp(cfg["data"]["train_start"])
+    expected_end = pd.Timestamp(cfg["data"]["test_end"])
 
     # Assert số dòng
     skeleton_len = len(pd.date_range(start=expected_start, end=expected_end, freq="D"))
@@ -575,7 +575,7 @@ def main() -> None:
     # BƯỚC 4: Validate
     # -----------------------------------------------------------------------
     logger.info("=== BƯỚC 4: Validate ===")
-    validate_base_table(base_table)
+    validate_base_table(base_table, cfg)
 
     # Log thống kê
     n_null_revenue = int(base_table["revenue"].isna().sum()) if "revenue" in base_table.columns else -1

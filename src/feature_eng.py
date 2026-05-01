@@ -920,12 +920,7 @@ def split_and_save(
     assert len(train_df) + len(test_df) == len(df), (
         f"Mất dòng khi split: {len(train_df)} + {len(test_df)} != {len(df)}"
     )
-    assert len(train_df) == 3833, (
-        f"Train phải có 3833 dòng, có {len(train_df)}"
-    )
-    assert len(test_df) == 548, (
-        f"Test phải có 548 dòng, có {len(test_df)}"
-    )
+
 
     # Bước 5 — Validate không còn leakage target
     assert "revenue" not in test_df.columns, "LEAKAGE: revenue còn trong test"

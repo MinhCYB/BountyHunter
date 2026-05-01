@@ -319,7 +319,7 @@ def build_submission(
         rev_preds = model_rev.predict(X_test)
         rev_preds = np.expm1(rev_preds)  # ONE TIME. Never again downstream.
 
-    rev_preds = np.clip(rev_preds, 0, None)
+    rev_preds = np.clip(rev_preds, 0, 6500000)
 
     # Predict Margin
     if hybrid_enabled:
