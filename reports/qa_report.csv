@@ -1,4 +1,0 @@
-﻿Table,Columns,Category,Issue Description,Impact Rows,Sample Evidence,Note
-order_items,promo_id,Business_Rules: MOV,Tổng đơn hàng không đạt mức tối thiểu của Mã chính,110717,"Order IDs: [103053, 103055, 103057, 103058, 103059]",Hướng xử lý: Xóa mã và tính lại
-order_items,promo_id_2,Business_Rules: MOV,Tổng đơn hàng không đạt mức tối thiểu của Mã phụ,206,"Order IDs: [320123, 320125, 320126, 320128, 320129]",Hướng xử lý: Xóa mã và tính lại
-order_items,discount_amount,Business_Rules: Math,discount_amount không khớp với tổng chiết khấu dự kiến,178,"Order IDs: [320123, 320125, 320126, 320129, 320136]",Hướng xử lý: Tính lại theo công thức

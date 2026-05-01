@@ -1,0 +1,54 @@
+table,column,check_name,status,n_violations,detail
+sales,,row_count,PASS,0,3833 dòng đúng kỳ vọng
+sales,date,null_check,PASS,0,Không có null
+sales,revenue,null_check,PASS,0,Không có null
+sales,cogs,null_check,PASS,0,Không có null
+orders,,row_count,PASS,0,646945 dòng đúng kỳ vọng
+orders,order_id,null_check,PASS,0,Không có null
+orders,order_date,null_check,PASS,0,Không có null
+orders,customer_id,null_check,PASS,0,Không có null
+orders,zip,null_check,PASS,0,Không có null
+orders,order_status,null_check,PASS,0,Không có null
+orders,payment_method,null_check,PASS,0,Không có null
+orders,device_type,null_check,PASS,0,Không có null
+orders,order_source,null_check,PASS,0,Không có null
+order_items,order_id,null_check,PASS,0,Không có null
+order_items,product_id,null_check,PASS,0,Không có null
+order_items,quantity,null_check,PASS,0,Không có null
+order_items,unit_price,null_check,PASS,0,Không có null
+order_items,discount_amount,null_check,PASS,0,Không có null
+products,,row_count,PASS,0,2412 dòng đúng kỳ vọng
+products,product_id,null_check,PASS,0,Không có null
+products,product_name,null_check,PASS,0,Không có null
+products,category,null_check,PASS,0,Không có null
+products,segment,null_check,PASS,0,Không có null
+products,size,null_check,PASS,0,Không có null
+products,color,null_check,PASS,0,Không có null
+products,price,null_check,PASS,0,Không có null
+products,cogs,null_check,PASS,0,Không có null
+inventory,,row_count,PASS,0,60247 dòng đúng kỳ vọng
+inventory,snapshot_date,null_check,PASS,0,Không có null
+inventory,product_id,null_check,PASS,0,Không có null
+inventory,stock_on_hand,null_check,PASS,0,Không có null
+inventory,units_received,null_check,PASS,0,Không có null
+inventory,units_sold,null_check,PASS,0,Không có null
+inventory,stockout_days,null_check,PASS,0,Không có null
+inventory,days_of_supply,null_check,PASS,0,Không có null
+inventory,fill_rate,null_check,PASS,0,Không có null
+inventory,stockout_flag,null_check,PASS,0,Không có null
+inventory,overstock_flag,null_check,PASS,0,Không có null
+inventory,reorder_flag,null_check,PASS,0,Không có null
+inventory,sell_through_rate,null_check,PASS,0,Không có null
+inventory,product_name,null_check,PASS,0,Không có null
+inventory,category,null_check,PASS,0,Không có null
+inventory,segment,null_check,PASS,0,Không có null
+inventory,year,null_check,PASS,0,Không có null
+inventory,month,null_check,PASS,0,Không có null
+sales,revenue,positive_check,PASS,0,revenue > 0 toàn bộ
+sales,cogs,positive_check,PASS,0,cogs > 0 toàn bộ
+sales,date,date_range,PASS,0,Date range trong giới hạn
+products,cogs/price,cogs_lt_price,PASS,0,cogs < price toàn bộ
+inventory,reorder_flag,constant_check,PASS,0,"CONSTANT = 0, an toàn để drop"
+order_items,promo_id_2,high_null_check,PASS,0,null_rate=99.97% ≥ 95% đúng kỳ vọng
+orders→customers,customer_id,fk_integrity_customer_id,PASS,0,Toàn bộ FK hợp lệ
+order_items→orders,order_id,fk_integrity_order_id,PASS,0,Toàn bộ FK hợp lệ

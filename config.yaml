@@ -1,0 +1,292 @@
+# =============================================================
+# CONFIG.YAML — Single Source of Truth
+# Mọi thay đổi hành vi pipeline phải qua file này.
+# =============================================================
+
+# --- Đường dẫn ---
+paths:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  model_dir: "models"
+  output_dir: "outputs"
+  log_dir: "logs"
+
+# --- Cấu hình dữ liệu ---
+data:
+  train_start: "2021-01-01"
+  train_end: "2022-12-31"
+  test_start: "2023-01-01"
+  test_end: "2024-07-01"
+  date_col: "Date"
+  target_revenue: "revenue"           # lowercase sau khi chuẩn hóa
+  target_margin: "margin"             # = COGS / Revenue
+  target_cogs: "cogs"                 # KHÔNG downcast
+  nullable_by_design:                 # Các cột giữ nguyên NaN
+    - "promo_id"
+    - "promo_id_2"
+    - "applicable_category"
+    - "gender"
+    - "age_group"
+    - "acquisition_channel"
+  drop_constant_cols:                 # Cột constant bị loại
+    - "reorder_flag"
+
+# --- Cross-Validation ---
+cv:
+  strategy: "expanding_window"
+  n_splits: 5
+  min_train_days: 365                 # Số ngày tối thiểu trong fold đầu tiên
+  gap_days: 0                         # Số ngày gap giữa train và val
+  # Bắt buộc dùng Date Masking — xem PART_II
+
+# --- Model Registry ---
+models:
+  active: "xgboost"                  # lightgbm | xgboost | catboost | prophet
+  random_seed: 42
+
+  lightgbm:
+    n_estimators: 1000
+    learning_rate: 0.05
+    num_leaves: 63
+    max_depth: -1
+    min_child_samples: 20
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 5
+    reg_alpha: 0.1
+    reg_lambda: 0.1
+    early_stopping_rounds: 50
+    verbose: -1
+
+  xgboost:
+    n_estimators: 1000
+    learning_rate: 0.01
+    max_depth: 6
+    min_child_weight: 5
+    subsample: 0.8
+    colsample_bytree: 0.8
+    reg_alpha: 0.1
+    reg_lambda: 1.0
+    early_stopping_rounds: 50
+    verbosity: 0
+
+  catboost:
+    iterations: 1000
+    learning_rate: 0.05
+    depth: 6
+    l2_leaf_reg: 3.0
+    early_stopping_rounds: 50
+    verbose: 0
+
+  prophet:
+    seasonality_mode: "multiplicative"
+    yearly_seasonality: true
+    weekly_seasonality: true
+    daily_seasonality: false
+    changepoint_prior_scale: 0.05
+    seasonality_prior_scale: 10.0
+
+# --- Feature Engineering Toggles ---
+features:
+
+  # Nhóm 1: Ngày lễ Việt Nam
+  vn_holidays:
+    enabled: true
+    cols:
+      - "is_tet"              # Tết Nguyên Đán (±7 ngày)
+      - "is_30_4"             # 30/4
+      - "is_1_5"              # 1/5
+      - "is_2_9"              # 2/9
+      - "is_christmas"        # 25/12
+      - "days_to_next_holiday"  # Số ngày đến holiday kế tiếp
+      - "days_from_last_holiday" # Số ngày từ holiday gần nhất
+
+  # Nhóm 2: Promotion Intensity Score (PIS)
+  promotion_intensity:
+    enabled: true
+    cols:
+      - "n_active_promos"           # Số campaign đang chạy trong ngày
+      - "max_discount_pct"          # % giảm cao nhất trong ngày
+      - "has_stackable_promo"       # Flag có promo stackable
+      - "pis_score"                 # Tổng hợp: n_active * max_discount
+    # PIS tính từ promotions.csv theo ngày — không có leakage
+
+  # Nhóm 3: Fourier Seasonality
+  fourier_seasonality:
+    enabled: true
+    periods:
+      - 7      # Weekly
+      - 30     # Monthly
+      - 365    # Annual
+    n_terms: 3  # Số cặp sin/cos mỗi period
+
+  # Nhóm 4: MACD trên lag revenue
+  macd_revenue:
+    enabled: false
+    # Tất cả rolling/lag phải .shift(1) trước khi tính — xem PART_II
+    fast_window: 12
+    slow_window: 26
+    signal_window: 9
+    cols:
+      - "macd_line"
+      - "macd_signal"
+      - "macd_histogram"
+
+  # Nhóm 5: Price Discount Elasticity
+  price_discount_elasticity:
+    enabled: false
+    # Tính từ order_items.csv aggregate theo ngày, shift(1)
+    cols:
+      - "avg_discount_rate_lag1"    # Tỉ lệ giảm giá TB ngày hôm trước
+      - "elasticity_7d"             # Hệ số co giãn 7 ngày
+      - "discount_revenue_corr_30d" # Tương quan discount-revenue 30 ngày
+
+  # Nhóm base: Luôn bật
+  base_time_features:
+    enabled: true
+    cols:
+      - "day_of_week"
+      - "day_of_month"
+      - "week_of_year"
+      - "month"
+      - "quarter"
+      - "year"
+      - "is_weekend"
+      - "is_month_start"
+      - "is_month_end"
+      - "is_quarter_start"
+      - "is_quarter_end"
+
+  base_lag_features:
+    enabled: false
+    lag_days:
+      - 365
+      - 366
+      - 367
+    rolling_windows:
+      - 7
+      - 14
+      - 30
+      - 90
+    rolling_aggs:
+      - "mean"
+      - "std"
+      - "min"
+      - "max"
+
+  cyclical_features:
+    enabled: true
+    encodings:
+      - col: "month"
+        period: 12
+        out_sin: "sin_month"
+        out_cos: "cos_month"
+      - col: "day_of_week"
+        period: 7
+        out_sin: "sin_dow"
+        out_cos: "cos_dow"
+      - col: "day_of_year"
+        period: 365
+        out_sin: "sin_doy"
+        out_cos: "cos_doy"
+      - col: "week_of_year"
+        period: 52
+        out_sin: "sin_woy"
+        out_cos: "cos_woy"
+
+  trend_features:
+    enabled: true
+
+  web_traffic_features:
+    enabled: true
+    # Aggregate web_traffic.csv theo ngày, shift(1)
+    cols:
+      - "sessions_lag1"
+      - "unique_visitors_lag1"
+      - "page_views_lag1"
+      - "bounce_rate_lag1"
+      - "sessions_roll7_mean"
+      - "page_views_roll7_mean"
+
+  inventory_features:
+    enabled: false
+
+  killer_features:
+    enabled: true
+    promo_discount_threshold: 20.0
+    promo_lookahead_days: 14
+    fill_rate_floor: 0.01
+    # Monthly snapshot — forward-fill sang ngày, shift(1)
+    cols:
+      - "avg_fill_rate_lag1m"
+      - "avg_stockout_days_lag1m"
+      - "pct_stockout_skus_lag1m"
+      - "avg_sell_through_lag1m"
+
+
+
+# --- Post Processing ---
+post_processing:
+  enabled: true
+  revenue_clip_lower: 0.0              # Clip Revenue âm về 0
+  margin_clip_lower: 0.0               # Clip Margin âm về 0
+  margin_clip_upper: 1.0               # Clip Margin vượt 1
+  revenue_winsorize_enabled: true      # Bật/tắt winsorize Revenue cao bất thường
+  revenue_winsorize_multiplier: 2.0    # upper_bound = revenue_p99 * multiplier
+
+covid_period:
+  enabled: false
+  start: "2020-04-06"      # configurable, không hardcode trong code
+  end:   "2021-12-31"      # configurable
+  sample_weight: 0.1       # trọng số cho ngày COVID, sweep sau nếu cần
+
+# --- SHAP ---
+explainability:
+  shap_enabled: true
+  shap_sample_size: 500             # Số mẫu để tính SHAP (tránh OOM)
+  output_format: "html"             # html | png
+
+# --- Logging ---
+logging:
+  level: "INFO"                     # DEBUG | INFO | WARNING | ERROR
+  format: "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+
+hybrid:
+  enabled: true
+  trend_model: "prophet"           # prophet | ridge — dùng ridge trước để
+                                  # validate nhanh, switch prophet sau
+  residual_model: "xgboost"
+
+  trend:
+    prophet:
+      seasonality_mode: "additive"    # additive | multiplicative
+      yearly_seasonality: true
+      weekly_seasonality: true
+      daily_seasonality: false
+      changepoint_prior_scale: 0.15
+      seasonality_prior_scale: 10.0
+    ridge:
+      alpha: 1.0
+
+  residual:
+    feature_groups:              # CHỈ các nhóm này được dùng cho XGBoost
+      - "base_time_features"
+      - "fourier_seasonality"
+      - "cyclical_features"
+      - "vn_holidays"
+      # - "base_lag_features"
+      - "killer_features"
+    feature_prefixes:
+      base_time_features: ["day_", "week_", "month", "quarter", "year", "is_weekend", "is_month", "is_quarter"]
+      fourier_seasonality: ["sin_", "cos_"]
+      cyclical_features: ["sin_", "cos_"]
+      vn_holidays: ["is_tet", "is_30_4", "is_1_5", "is_2_9", "is_christmas", "days_to_next_holiday", "days_from_last_holiday"]
+      promotion_intensity: ["n_active_", "max_discount_", "has_stackable_", "pis_"]
+      trend_features: ["trend_"]
+      base_lag_features: ["lag_", "roll"]
+      killer_features: ["days_to_next_major_promo", "expected_discount", "is_within", "inventory_stress", "is_stockout"]
+
+  residual_clip:
+    enabled: true
+    lower_quantile: 0.01
+    upper_quantile: 0.99
