@@ -23,7 +23,12 @@ import pandas as pd
 import numpy as np
 import yaml
 
-from train import HybridRegressor
+import __main__
+try:
+    from train import HybridRegressor
+except ImportError:
+    from src.train import HybridRegressor
+__main__.HybridRegressor = HybridRegressor
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +116,7 @@ def _find_latest_model_dir(base_model_dir: Path) -> Path:
 
 def load_model(model_dir: Path, cfg: dict = None, feature_cols: List[str] = None) -> Tuple[Any, Any]:
     """
-    Load model_revenue.pkl và model_margin.pkl từ thư mục model (hoặc HybridRegressor).
+    Load model_revenue.pkl và model_margin.pkl từ thư mục model.
 
     Parameters
     ----------
@@ -132,48 +137,6 @@ def load_model(model_dir: Path, cfg: dict = None, feature_cols: List[str] = None
     FileNotFoundError
         Nếu thiếu một trong hai file model.
     """
-    meta_path = model_dir / "metadata.json"
-    is_hybrid = False
-    train_date_min_str = None
-    if meta_path.exists():
-        import json
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        is_hybrid = meta.get("hybrid_enabled", False)
-        train_date_min_str = meta.get("train_date_min")
-
-    if is_hybrid:
-        path_trend_rev = model_dir / "model_trend_revenue.pkl"
-        path_resid_rev = model_dir / "model_residual_revenue.pkl"
-        path_trend_mar = model_dir / "model_trend_margin.pkl"
-        path_resid_mar = model_dir / "model_residual_margin.pkl"
-
-        for p in (path_trend_rev, path_resid_rev, path_trend_mar, path_resid_mar):
-            if not p.exists():
-                raise FileNotFoundError(f"Không tìm thấy model file: {p}")
-
-        with open(path_trend_rev, "rb") as f: trend_rev = pickle.load(f)
-        with open(path_resid_rev, "rb") as f: resid_rev = pickle.load(f)
-        with open(path_trend_mar, "rb") as f: trend_mar = pickle.load(f)
-        with open(path_resid_mar, "rb") as f: resid_mar = pickle.load(f)
-
-        hybrid_rev = HybridRegressor(cfg)
-        hybrid_rev.trend_model_ = trend_rev
-        hybrid_rev.residual_model_ = resid_rev
-        hybrid_rev.target_ = cfg["data"]["target_revenue"] if cfg else "revenue"
-        hybrid_rev.train_date_min_ = pd.Timestamp(train_date_min_str) if train_date_min_str else None
-        hybrid_rev.residual_cols_ = hybrid_rev._get_residual_feature_cols(feature_cols) if feature_cols else []
-
-        hybrid_mar = HybridRegressor(cfg)
-        hybrid_mar.trend_model_ = trend_mar
-        hybrid_mar.residual_model_ = resid_mar
-        hybrid_mar.target_ = cfg["data"]["target_margin"] if cfg else "margin_pred"
-        hybrid_mar.train_date_min_ = pd.Timestamp(train_date_min_str) if train_date_min_str else None
-        hybrid_mar.residual_cols_ = hybrid_mar._get_residual_feature_cols(feature_cols) if feature_cols else []
-
-        logger.info("Đã load Hybrid models từ: %s", model_dir)
-        return hybrid_rev, hybrid_mar
-
     path_rev = model_dir / "model_revenue.pkl"
     path_mar = model_dir / "model_margin.pkl"
 
@@ -248,51 +211,7 @@ def load_feature_cols(model_dir: Path) -> List[str]:
     return feature_cols
 
 
-def _predict_sklearn(model: Any, X: pd.DataFrame) -> pd.Series:
-    """
-    Dự báo bằng model sklearn-compatible.
 
-    Parameters
-    ----------
-    model : Any
-        Model đã fit (LightGBM / XGBoost / CatBoost).
-    X : pd.DataFrame
-        Feature matrix tập test.
-
-    Returns
-    -------
-    pd.Series
-        Series dự báo (reset index).
-    """
-    preds = model.predict(X)
-    return pd.Series(preds, index=X.index)
-
-
-def _predict_prophet(
-    model: Any,
-    df_test: pd.DataFrame,
-    feature_cols: list[str],
-) -> pd.Series:
-    """
-    Dự báo bằng Prophet.
-
-    Parameters
-    ----------
-    model : Any
-        Prophet model đã fit.
-    df_test : pd.DataFrame
-        Tập test với cột date và các cột regressor.
-    feature_cols : list[str]
-        Danh sách cột regressor đã được add_regressor.
-
-    Returns
-    -------
-    pd.Series
-        Series dự báo, index bằng với df_test.index.
-    """
-    future = df_test[["date"] + feature_cols].rename(columns={"date": "ds"})
-    forecast = model.predict(future)
-    return pd.Series(forecast["yhat"].values, index=df_test.index)
 
 
 def _postprocess_predictions(
@@ -384,29 +303,36 @@ def build_submission(
 
     logger.info("Số feature dùng cho inference: %d", len(feature_cols))
 
-    is_hybrid = cfg.get("hybrid", {}).get("enabled", False)
+    X_test = df[feature_cols].copy()
+    drop_cols = ["sample_weight", "is_covid_period"]
+    X_test = X_test.drop(columns=[c for c in drop_cols if c in X_test.columns])
+    
+    hybrid_enabled: bool = cfg.get("hybrid", {}).get("enabled", False)
 
-    # Predict
-    if model_name == "prophet":
-        rev_preds = _predict_prophet(model_rev, df, feature_cols)
-        mar_preds = _predict_prophet(model_mar, df, feature_cols)
-    elif is_hybrid:
-        rev_preds = pd.Series(model_rev.predict(df), index=df.index)
-        mar_preds = pd.Series(model_mar.predict(df), index=df.index)
+    # Predict Revenue
+    if hybrid_enabled:
+        # HybridRegressor.predict() needs the full df slice (uses date internally)
+        # It returns predictions already in original scale — DO NOT call expm1
+        rev_preds = model_rev.predict(df[feature_cols + ["date"]].copy() if "date" in df.columns else df[feature_cols].copy())
     else:
-        X_test = df[feature_cols].copy()
-        drop_cols = ["sample_weight", "is_covid_period"]
-        X_test = X_test.drop(columns=[c for c in drop_cols if c in X_test.columns])
-        
-        rev_preds = _predict_sklearn(model_rev, X_test)
-        mar_preds = _predict_sklearn(model_mar, X_test)
-        
-        rev_preds = np.expm1(rev_preds)
+        # Pure XGBoost: output is log-scale, must invert exactly once
+        rev_preds = model_rev.predict(X_test)
+        rev_preds = np.expm1(rev_preds)  # ONE TIME. Never again downstream.
+
+    rev_preds = np.clip(rev_preds, 0, None)
+
+    # Predict Margin
+    if hybrid_enabled:
+        mar_preds = model_mar.predict(df[feature_cols + ["date"]].copy() if "date" in df.columns else df[feature_cols].copy())
+    else:
+        mar_preds = model_mar.predict(X_test)
+
+    mar_preds = np.clip(mar_preds, 0, None)
 
     # Khởi tạo result
     result = df[[date_col]].copy()
-    result["Revenue"] = rev_preds.values
-    result["margin_pred"] = mar_preds.values
+    result["Revenue"] = rev_preds
+    result["margin_pred"] = mar_preds
     result["COGS"] = result["Revenue"] * result["margin_pred"]
 
     # Post-process (clip and winsorize)

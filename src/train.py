@@ -22,6 +22,7 @@ from typing import Any, Dict, Iterator, List, Tuple
 
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 import yaml
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from tqdm import tqdm
@@ -450,16 +451,7 @@ def run_cv(
     for fold_idx, (df_train, df_val) in enumerate(
         tqdm(cv_gen, desc=f"CV [{target}]", total=n_splits)
     ):
-        if cfg.get("hybrid", {}).get("enabled", False):
-            hybrid = HybridRegressor(cfg)
-            hybrid.fit(
-                df=df_train,
-                target=target,
-                feature_cols=feature_cols,
-                eval_df=df_val,
-            )
-            y_pred = hybrid.predict(df_val)
-        elif model_name == "prophet":
+        if model_name == "prophet":
             model = get_model(model_name, model_cfg, seed)
             y_pred = _fit_predict_prophet(model, df_train, df_val, feature_cols, target)
         else:
@@ -763,140 +755,49 @@ class HybridRegressor:
 # 6. Final Training
 # ---------------------------------------------------------------------------
 
-def train_final_model(
-    df: pd.DataFrame,
-    feature_cols: List[str],
-    target: str,
-    cfg: dict,
-) -> Any:
-    """
-    Huấn luyện model cuối trên toàn bộ tập train.
+def train_final_model(df: pd.DataFrame, feature_cols: list, target: str, cfg: dict) -> tuple:
+    df = df.copy()
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Toàn bộ feature_table (chỉ phần train).
-    feature_cols : List[str]
-        Danh sách cột feature.
-    target : str
-        Tên cột target.
-    cfg : dict
-        Config đầy đủ.
+    hybrid_enabled: bool = cfg.get("hybrid", {}).get("enabled", False)
 
-    Returns
-    -------
-    Any
-        Model đã fit.
-    """
-    if cfg.get("hybrid", {}).get("enabled", False):
-        holdout_cutoff = df["date"].quantile(0.90, interpolation="nearest")
-        mask_tr  = df["date"] <  holdout_cutoff
-        mask_val = df["date"] >= holdout_cutoff
-        df_tr = df.loc[mask_tr].copy()
-        df_val = df.loc[mask_val].copy()
+    if hybrid_enabled:
+        # 30-day micro-holdout for XGBoost residual early stopping
+        holdout_cutoff = df["date"].max() - pd.Timedelta(days=30)
+        train_df = df[df["date"] <= holdout_cutoff].copy()
+        eval_df  = df[df["date"] >  holdout_cutoff].copy()
 
         model = HybridRegressor(cfg)
+        model.fit(train_df, target, feature_cols, eval_df=eval_df)
+
+    else:
+        # Pure XGBoost path (keep for hybrid.enabled: false fallback)
+        if target in ("revenue", "cogs"):
+            df[target] = np.log1p(df[target])
+
+        holdout_cutoff = df["date"].max() - pd.Timedelta(days=30)
+        train_df = df[df["date"] <= holdout_cutoff]
+        val_df   = df[df["date"] >  holdout_cutoff]
+
+        X_train, y_train = train_df[feature_cols], train_df[target]
+        X_val,   y_val   = val_df[feature_cols],   val_df[target]
+
+        xgb_params = cfg["models"]["xgboost"].copy()
+        early_stopping_rounds = xgb_params.pop("early_stopping_rounds", 50)
+        verbosity = xgb_params.pop("verbosity", 0)
+
+        model = xgb.XGBRegressor(
+            **xgb_params,
+            early_stopping_rounds=early_stopping_rounds,
+            verbosity=verbosity,
+            random_state=cfg["models"]["random_seed"],
+        )
         model.fit(
-            df=df_tr,
-            target=target,
-            feature_cols=feature_cols,
-            eval_df=df_val,
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
         )
-        logger.info("Đã huấn luyện final model [Hybrid] cho target '%s'", target)
-        return model
 
-    model_name: str = cfg["models"]["active"]
-    seed: int = cfg["models"]["random_seed"]
-    model_cfg: dict = cfg["models"][model_name]
-
-    model = get_model(model_name, model_cfg, seed)
-
-    if model_name == "prophet":
-        train_prophet = df[["date", target] + feature_cols].rename(
-            columns={"date": "ds", target: "y"}
-        )
-        for col in feature_cols:
-            model.add_regressor(col)
-        model.fit(train_prophet)
-    elif model_name in ("lightgbm", "xgboost", "catboost"):
-        X = df[feature_cols].copy()
-        y = df[target]
-
-        # FIX-4: carve out a temporal hold-out to re-enable early stopping
-        holdout_cutoff = df["date"].quantile(0.90, interpolation="nearest")
-        mask_tr  = df["date"] <  holdout_cutoff
-        mask_val = df["date"] >= holdout_cutoff
-        X_tr  = df.loc[mask_tr,  feature_cols].copy()
-        X_val = df.loc[mask_val, feature_cols].copy()
-        y_tr  = df.loc[mask_tr,  target]
-        y_val = df.loc[mask_val, target]
-        
-        sw_train = X_tr["sample_weight"].values if "sample_weight" in X_tr.columns else None
-        sw_val = X_val["sample_weight"].values if "sample_weight" in X_val.columns else None
-
-        drop_cols = ["sample_weight", "is_covid_period"]
-        X_tr = X_tr.drop(columns=[c for c in drop_cols if c in X_tr.columns])
-        X_val = X_val.drop(columns=[c for c in drop_cols if c in X_val.columns])
-        X = X.drop(columns=[c for c in drop_cols if c in X.columns])
-
-        # FIX-3a: log-transform target to stabilise variance
-        _use_log   = target in ("revenue", "cogs")
-        y_train_log = np.log1p(y_tr)   if _use_log else y_tr
-        y_val_log   = np.log1p(y_val)  if _use_log else y_val
-
-        if model_name == "lightgbm":
-            from lightgbm import LGBMRegressor
-            import lightgbm as lgb
-            final_cfg = {k: v for k, v in model_cfg.items() if k != "early_stopping_rounds"}
-            model = LGBMRegressor(**final_cfg, random_state=seed)
-            fit_kwargs = {}
-            if sw_train is not None:
-                fit_kwargs["sample_weight"] = sw_train
-                fit_kwargs["sample_weight_eval_set"] = [sw_val]
-            model.fit(
-                X_tr, y_train_log,
-                eval_set=[(X_val, y_val_log)],
-                callbacks=[lgb.early_stopping(50), lgb.log_evaluation(False)],
-                **fit_kwargs
-            )
-        elif model_name == "xgboost":
-            from xgboost import XGBRegressor
-            final_cfg = {k: v for k, v in model_cfg.items() if k != "early_stopping_rounds"}
-            final_cfg["early_stopping_rounds"] = model_cfg.get("early_stopping_rounds", 50)
-            model = XGBRegressor(**final_cfg, random_state=seed, tree_method="hist")
-            fit_kwargs = {}
-            if sw_train is not None:
-                fit_kwargs["sample_weight"] = sw_train
-                fit_kwargs["sample_weight_eval_set"] = [sw_val]
-            model.fit(
-                X_tr, y_train_log,
-                eval_set=[(X_val, y_val_log)],
-                verbose=False,
-                **fit_kwargs
-            )
-        elif model_name == "catboost":
-            from catboost import CatBoostRegressor
-            final_cfg = {k: v for k, v in model_cfg.items() if k != "early_stopping_rounds"}
-            model = CatBoostRegressor(**final_cfg, random_seed=seed, early_stopping_rounds=50)
-            fit_kwargs = {}
-            if sw_train is not None:
-                fit_kwargs["sample_weight"] = sw_train
-            model.fit(
-                X_tr, y_train_log,
-                eval_set=(X_val, y_val_log),
-                verbose=False,
-                **fit_kwargs
-            )
-
-        predictions = model.predict(X)
-        # FIX-3b: inverse log-transform predictions
-        predictions = np.expm1(predictions) if _use_log else predictions
-        
-        if target == "margin":
-            predictions = np.clip(predictions, 0.0, 1.0)
-
-    logger.info("Đã huấn luyện final model [%s] cho target '%s'", model_name, target)
-    return model
+    return model, feature_cols
 
 
 # ---------------------------------------------------------------------------
@@ -1135,35 +1036,14 @@ def main() -> None:
         all_cv_metrics[target] = cv_result
 
         logger.info("Bắt đầu final training cho target: %s", target)
-        final_model = train_final_model(df_train_full, feature_cols, target, cfg)
+        final_model, feature_cols = train_final_model(df_train_full, feature_cols, target, cfg)
 
-        if cfg.get("hybrid", {}).get("enabled", False):
-            save_model(final_model.trend_model_, run_dir / f"model_trend_{target}.pkl")
-            save_model(final_model.residual_model_, run_dir / f"model_residual_{target}.pkl")
-            
-            meta_path = run_dir / "metadata.json"
-            meta = {}
-            if meta_path.exists():
-                import json
-                with open(meta_path, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-            meta["hybrid_enabled"] = True
-            meta["train_date_min"] = str(final_model.train_date_min_)
-            import json
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, indent=2)
-        else:
-            model_filename = f"model_{target}.pkl"
-            save_model(final_model, run_dir / model_filename)
+        model_filename = f"model_{target}.pkl"
+        save_model(final_model, run_dir / model_filename)
 
         # SHAP
-        is_hybrid = cfg.get("hybrid", {}).get("enabled", False)
         if cfg["explainability"]["shap_enabled"]:
-            if is_hybrid:
-                shap_model = final_model.residual_model_
-                shap_cols = final_model.residual_cols_
-                valid_model = True
-            elif model_name != "prophet":
+            if model_name != "prophet":
                 shap_model = final_model
                 shap_cols = feature_cols
                 valid_model = True

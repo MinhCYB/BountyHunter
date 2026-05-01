@@ -160,9 +160,9 @@ features:
   base_lag_features:
     enabled: true
     lag_days:
-      - 730
-      - 731
-      - 732
+      - 365
+      - 366
+      - 367
     rolling_windows:
       - 7
       - 14
@@ -198,7 +198,7 @@ features:
     enabled: true
 
   web_traffic_features:
-    enabled: true
+    enabled: false
     # Aggregate web_traffic.csv theo ngày, shift(1)
     cols:
       - "sessions_lag1"
@@ -252,7 +252,7 @@ logging:
   format: "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
 
 hybrid:
-  enabled: true
+  enabled: false
   trend_model: "prophet"           # prophet | ridge — dùng ridge trước để
                                   # validate nhanh, switch prophet sau
   residual_model: "xgboost"
